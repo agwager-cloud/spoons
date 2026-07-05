@@ -12,16 +12,21 @@
     "dev": "concurrently -n SERVER,CLIENT -c auto \"npm run server:dev\" \"npm run client:dev\"",
     "client:dev": "npm --workspace client run dev",
     "server:dev": "npm --workspace server run dev",
-    "server:start": "npm --workspace server run start",
+    "server:start": "npm --workspace server run build && npm --workspace server run start",
     "build": "npm --workspace shared run build && npm --workspace client run build && npm --workspace server run build",
     "client:build": "npm --workspace client run build",
     "server:build": "npm --workspace server run build",
     "zip:client": "npm run client:build && cd client/dist && zip -r ../../spoons-itch-client.zip .",
-    "clean": "rimraf client/dist server/dist shared/dist spoons-itch-client.zip"
+    "clean": "rimraf client/dist server/dist shared/dist spoons-itch-client.zip",
+    "start": "npm run server:start",
+    "render:build": "npm install && npm run server:build"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
     "rimraf": "^6.0.1",
     "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": "22.x"
   }
 }

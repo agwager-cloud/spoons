@@ -136,3 +136,43 @@ For itch.io/hosted builds, set `VITE_SERVER_URL` before building the client.
 - Preloads the music safely with relative asset paths for itch.io.
 - Sound toggle now pauses/resumes the shared background track across Start, Lobby, Game, and Results scenes.
 - Music waits for the browser audio unlock event, so it should begin after the first user interaction when sound is enabled.
+
+## Hotfix 15 — Render server build fix
+
+Render was failing with:
+
+```text
+Cannot find module '/opt/render/project/src/server/dist/index.js'
+```
+
+Cause: Render was running `npm install` and then `npm run server:start`, but the TypeScript server had not been compiled, so `server/dist/index.js` did not exist.
+
+Fix included in this hotfix:
+
+```json
+"server:start": "npm --workspace server run build && npm --workspace server run start",
+"start": "npm run server:start",
+"engines": { "node": "22.x" }
+```
+
+Recommended Render settings:
+
+```text
+Root Directory: leave blank
+Build Command: npm install
+Start Command: npm run server:start
+Health Check Path: /health
+```
+
+Alternative Render build command, if preferred:
+
+```text
+npm install && npm run server:build
+```
+
+Then keep the start command as:
+
+```text
+npm run server:start
+```
+
