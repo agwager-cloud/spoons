@@ -92,6 +92,9 @@ export class GameScene extends Phaser.Scene {
   private activeTimerStartedAt = 0;
   private activeTimerDurationMs = 5000;
   private activeTimerInitialRemainingMs = 5000;
+  private serverTimeOffsetMs = 0;
+  private serverTurnEndsAtMs = 0;
+  private serverTurnNumber = -1;
   private spectatorHand = false;
   private handOwnerName = "Dealer";
   private objects: Phaser.GameObjects.GameObject[] = [];
@@ -190,60 +193,52 @@ export class GameScene extends Phaser.Scene {
 
   private syncCardTimerFromHand(payload: any, incomingNewCardId: string) {
     if (!incomingNewCardId) return;
-
-    const duration = Number(payload?.pulseMs ?? Net.lastRoomInfo?.pulseMs ?? 5000) || 5000;
-    const incomingSeqRaw = payload?.turnSeq ?? Net.lastRoomInfo?.turnSeq ?? 0;
-    const incomingSeq = Number.isFinite(Number(incomingSeqRaw)) ? Number(incomingSeqRaw) : this.turnSeq;
-    const key = `${incomingSeq}`;
-
-    // Full timer rewrite: the visible countdown is now a purely local stopwatch
-    // anchored once per server turnSeq. Repeated hand packets from bot flips,
-    // spoon grabs, room-info refreshes, or spectator updates must NOT reset it.
-    if (key !== this.activeTimerKey) {
-      const nextPulseMsRaw = Number(payload?.nextPulseMs ?? Net.lastRoomInfo?.nextPulseMs ?? 0);
-      const remainingMs = Number.isFinite(nextPulseMsRaw) && nextPulseMsRaw > 250
-        ? Math.min(duration, nextPulseMsRaw)
-        : duration;
-      this.activeTimerKey = key;
-      this.turnSeq = incomingSeq;
-      this.localPulseKey = `${key}:${incomingNewCardId}`;
-      this.localPulseDuration = duration;
-      this.turnTimerDurationMs = duration;
-      this.activeTimerDurationMs = duration;
-      this.activeTimerInitialRemainingMs = remainingMs;
-      this.activeTimerStartedAt = performance.now();
-      this.turnTimerDeadlineMs = this.activeTimerStartedAt + remainingMs;
-      this.localPulseDeadline = Date.now() + remainingMs;
-    }
-
+    this.anchorTurnTimer(payload, incomingNewCardId);
     this.lastHandNewCardId = incomingNewCardId;
   }
 
   private anchorPulseFromRoomInfo(info: any) {
     const roundStartsAt = Number(info?.roundStartsAt ?? 0);
     if (roundStartsAt > 0) return;
+    this.anchorTurnTimer(info, this.newCardId || "pending");
+  }
 
-    const incomingSeqRaw = info?.turnSeq ?? this.turnSeq;
-    const incomingSeq = Number.isFinite(Number(incomingSeqRaw)) ? Number(incomingSeqRaw) : this.turnSeq;
-    const key = `${incomingSeq}`;
-    const nextPulseMs = Number(info?.nextPulseMs ?? 0);
+  private anchorTurnTimer(payload: any, cardKey: string) {
+    if (!payload) return;
 
-    // Only anchor from roomInfo when a genuinely new pass window begins and the
-    // matching hand packet has not already done it. Never reset the same turn.
-    if (key !== this.activeTimerKey && nextPulseMs > 250) {
-      const duration = Number(info?.pulseMs ?? 5000) || 5000;
-      const remainingMs = Math.min(duration, nextPulseMs);
-      this.activeTimerKey = key;
-      this.turnSeq = incomingSeq;
-      this.localPulseKey = `${key}:${this.newCardId || "pending"}`;
-      this.localPulseDuration = duration;
-      this.turnTimerDurationMs = duration;
-      this.activeTimerDurationMs = duration;
-      this.activeTimerInitialRemainingMs = remainingMs;
-      this.activeTimerStartedAt = performance.now();
-      this.turnTimerDeadlineMs = this.activeTimerStartedAt + remainingMs;
-      this.localPulseDeadline = Date.now() + remainingMs;
+    const serverNow = Number(payload.serverNow ?? 0);
+    if (Number.isFinite(serverNow) && serverNow > 0) {
+      this.serverTimeOffsetMs = serverNow - Date.now();
     }
+
+    const duration = Number(payload.turnDurationMs ?? payload.pulseMs ?? Net.lastRoomInfo?.turnDurationMs ?? Net.lastRoomInfo?.pulseMs ?? 5000) || 5000;
+    const incomingTurnRaw = payload.turnNumber ?? payload.turnSeq ?? Net.lastRoomInfo?.turnNumber ?? Net.lastRoomInfo?.turnSeq ?? this.turnSeq;
+    const incomingTurn = Number.isFinite(Number(incomingTurnRaw)) ? Number(incomingTurnRaw) : this.turnSeq;
+    const endsAtRaw = Number(payload.currentTurnEndsAt ?? payload.nextPulseAt ?? 0);
+    const endsAt = Number.isFinite(endsAtRaw) ? endsAtRaw : 0;
+    if (incomingTurn <= 0 || endsAt <= 0) return;
+
+    const key = `${incomingTurn}:${Math.round(endsAt)}`;
+    if (key === this.activeTimerKey) return;
+
+    const estimatedNow = this.estimatedServerNow();
+    const remainingMs = Math.max(0, Math.min(duration, endsAt - estimatedNow));
+    this.activeTimerKey = key;
+    this.serverTurnNumber = incomingTurn;
+    this.serverTurnEndsAtMs = endsAt;
+    this.turnSeq = incomingTurn;
+    this.localPulseKey = `${key}:${cardKey}`;
+    this.localPulseDuration = duration;
+    this.turnTimerDurationMs = duration;
+    this.activeTimerDurationMs = duration;
+    this.activeTimerInitialRemainingMs = remainingMs > 0 ? remainingMs : duration;
+    this.activeTimerStartedAt = performance.now();
+    this.turnTimerDeadlineMs = this.activeTimerStartedAt + this.activeTimerInitialRemainingMs;
+    this.localPulseDeadline = Date.now() + this.activeTimerInitialRemainingMs;
+  }
+
+  private estimatedServerNow() {
+    return Date.now() + this.serverTimeOffsetMs;
   }
 
   private getCountdownMs(state: any): number {
@@ -317,7 +312,7 @@ export class GameScene extends Phaser.Scene {
     const spoonsAvailable = Number(Net.lastRoomInfo?.spoonsAvailable ?? state.spoonsAvailable ?? 0);
     const takenSpoons = numberArrayFromSchema(Net.lastRoomInfo?.takenSpoonsJson ?? Net.lastRoomInfo?.takenSpoons ?? state.takenSpoonsJson);
     const spoonCount = Math.max(0, spoonsAvailable - takenSpoons.length);
-    const canGrabFirst = this.hasFourOfKind() && !this.newCardFaceDown && !scrambleActive && !countdownActive && !me?.spectator && !me?.eliminated && !hasSpoon && spoonCount > 0;
+    const canGrabFirst = this.hasFourOfKind() && !scrambleActive && !countdownActive && !me?.spectator && !me?.eliminated && !hasSpoon && spoonCount > 0;
     const canGrabScramble = scrambleActive && !countdownActive && !me?.spectator && !me?.eliminated && !hasSpoon && spoonCount > 0;
     this.drawSpoons(spoonCount, scrambleActive, spoonsAvailable, takenSpoons, canGrabFirst || canGrabScramble, hasSpoon, canGrabFirst);
 
@@ -335,8 +330,8 @@ export class GameScene extends Phaser.Scene {
               : scrambleActive
               ? "A spoon has been taken. Click one of the remaining spoons before they run out."
               : this.newCardFaceDown
-              ? "Tap FLIP on the new card, then choose one of your 5 cards to pass left."
-              : "Choose one card to pass left before the timer reaches zero.";
+              ? "Tap FLIP on the new card, then choose one of your original 4 cards to pass left."
+              : "Choose one of your original 4 cards to keep the new card, or let the new card pass on.";
     this.objects.push(this.add.text(640, 104, status, {
       fontFamily: "Arial",
       fontSize: "19px",
@@ -491,7 +486,7 @@ export class GameScene extends Phaser.Scene {
       const faceDown = !!card.faceDown;
       const mustFlipFirst = !readOnly && this.newCardFaceDown;
       const canFlip = mustFlipFirst && isNew && faceDown;
-      const canSelect = !readOnly && !this.newCardFaceDown && !faceDown;
+      const canSelect = !readOnly && !this.newCardFaceDown && !faceDown && !isNew;
       const fill = faceDown ? 0x1e3a8a : isNew ? 0xfffbeb : 0xffffff;
       const stroke = selected ? 0xf97316 : faceDown ? 0xf59e0b : isNew ? 0xf2c94c : 0x102a43;
       const strokeWidth = selected ? 7 : isNew || faceDown ? 5 : 3;
@@ -553,10 +548,10 @@ export class GameScene extends Phaser.Scene {
     const instruction = readOnly
       ? "Spectators can watch the dealer hand while the remaining players continue."
       : this.newCardFaceDown
-        ? "Tap FLIP on the face-down new card first. The game only recognises four of a kind after the card is flipped."
+        ? "Tap FLIP on the face-down new card first. If you do nothing, the new card passes on and your hand stays unchanged."
         : this.selectedCardId
-          ? "Selected card will pass left on the next pulse. You can change your mind before the timer ends."
-          : "New card is revealed. Choose one of your 5 cards to discard left.";
+          ? "Selected original card will pass left. The new card will replace it when the timer ends."
+          : "New card is revealed. Choose one of your original 4 cards to keep it, or let the new card pass on.";
     this.objects.push(this.add.text(640, 692, instruction, {
       fontFamily: "Arial",
       fontSize: "16px",
@@ -572,26 +567,26 @@ export class GameScene extends Phaser.Scene {
   }
 
   private getPulseMsRemaining() {
-    if (this.activeTimerStartedAt > 0) {
-      const elapsed = performance.now() - this.activeTimerStartedAt;
-      return Math.max(0, this.activeTimerInitialRemainingMs - elapsed);
+    if (this.serverTurnEndsAtMs > 0) {
+      return Math.max(0, this.serverTurnEndsAtMs - this.estimatedServerNow());
     }
 
     const info = Net.lastRoomInfo ?? {};
+    const serverNow = Number(info.serverNow ?? 0);
+    const infoEndsAt = Number(info.currentTurnEndsAt ?? info.nextPulseAt ?? 0);
+    if (Number.isFinite(serverNow) && serverNow > 0 && Number.isFinite(infoEndsAt) && infoEndsAt > 0) {
+      const receivedAt = Number(info._receivedAt ?? Date.now());
+      const estimatedServerNow = serverNow + (Date.now() - receivedAt);
+      return Math.max(0, infoEndsAt - estimatedServerNow);
+    }
+
     const receivedAt = Number(info._receivedAt ?? 0);
     const fromInfoMs = Number(info.nextPulseMs);
     if (Number.isFinite(fromInfoMs) && fromInfoMs > 0 && receivedAt > 0) {
       return Math.max(0, fromInfoMs - (Date.now() - receivedAt));
     }
 
-    const infoAt = Number(info.nextPulseAt ?? 0);
-    if (Number.isFinite(infoAt) && infoAt > 0) return Math.max(0, infoAt - Date.now());
-
-    const state: any = Net.room?.state;
-    const stateAt = Number(state?.nextPulseAt ?? 0);
-    if (Number.isFinite(stateAt) && stateAt > 0) return Math.max(0, stateAt - Date.now());
-
-    return this.turnTimerDurationMs;
+    return 0;
   }
 
   private getPulseSecondsRemainingPrecise() {
@@ -599,7 +594,9 @@ export class GameScene extends Phaser.Scene {
   }
 
   private getPulseSecondsRemaining() {
-    return Math.max(0, Math.ceil(this.getPulseMsRemaining() / 1000));
+    const remainingMs = this.getPulseMsRemaining();
+    if (remainingMs <= 0) return 0;
+    return Math.max(1, Math.ceil(remainingMs / 1000));
   }
 
   private drawRoundInfo(roster: PlayerLike[], me?: PlayerLike) {
@@ -675,9 +672,20 @@ export class GameScene extends Phaser.Scene {
   }
 
   private hasFourOfKind() {
-    if (this.hand.length < 4 || this.spectatorHand || this.newCardFaceDown) return false;
+    if (this.hand.length < 4 || this.spectatorHand) return false;
+
+    const selectedOriginal = this.selectedCardId && this.selectedCardId !== this.newCardId
+      ? this.hand.find((card) => card.id === this.selectedCardId)
+      : undefined;
+    const cardsToCheck = selectedOriginal
+      ? this.hand.filter((card) => card.id !== this.selectedCardId)
+      : this.hand.filter((card) => card.id !== this.newCardId);
+
+    if (cardsToCheck.length < 4) return false;
     const ranks = new Map<string, number>();
-    this.hand.forEach((c) => ranks.set(c.rank, (ranks.get(c.rank) ?? 0) + 1));
+    cardsToCheck.forEach((c) => {
+      if (!c.faceDown && c.rank) ranks.set(c.rank, (ranks.get(c.rank) ?? 0) + 1);
+    });
     return Array.from(ranks.values()).some((count) => count >= 4);
   }
 

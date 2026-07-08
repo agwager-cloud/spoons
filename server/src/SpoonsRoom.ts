@@ -235,13 +235,9 @@ export class SpoonsRoom extends Room<SpoonsState> {
     }
     this.seedOpeningHands(current);
     this.markCurrentNewCardsFaceDown();
-    this.turnSeq += 1;
 
     this.recount();
-    this.sendAllRoomInfo();
-    this.sendAllHands();
-    this.scheduleBotFlips();
-    this.startPulseLoop();
+    this.startPassWindow(true);
   }
 
   private playAgainLegacy() {
@@ -275,6 +271,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.state.dealerId = "";
     this.state.roundMessage = "";
     this.state.roundStartsAt = 0;
+    this.clearTurnClock();
     this.recount();
     this.sendAllRoomInfo();
   }
@@ -293,41 +290,57 @@ export class SpoonsRoom extends Room<SpoonsState> {
   private startPulseLoop() {
     if (this.pulseTimer) clearTimeout(this.pulseTimer);
     this.pulseTimer = undefined;
-    this.scheduleNextPulse();
+    this.startPassWindow(true);
   }
 
-  private scheduleNextPulse(resetDeadline = true) {
-    // Keep the card-passing pulse running even after the first spoon is taken.
-    // This lets players keep flipping/passing and bluffing while the spoon scramble is live.
+  private startPassWindow(broadcast = true) {
+    // Every card window gets an authoritative server timestamp and a turn number.
+    // Clients render the visible countdown locally from these values, so the timer
+    // keeps moving even when no one flips, clicks, or receives a state patch.
     if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) {
-      this.state.nextPulseAt = 0;
+      this.clearTurnClock();
       this.syncState();
       this.sendAllRoomInfo();
       return;
     }
 
     if (this.pulseTimer) clearTimeout(this.pulseTimer);
-    if (resetDeadline || this.state.nextPulseAt <= Date.now()) this.state.nextPulseAt = Date.now() + PULSE_MS;
-    const delay = Math.max(50, this.state.nextPulseAt - Date.now());
+    const now = Date.now();
+    this.turnSeq += 1;
+    this.state.currentTurnStartedAt = now;
+    this.state.currentTurnEndsAt = now + PULSE_MS;
+    this.state.turnDurationMs = PULSE_MS;
+    this.state.turnNumber = this.turnSeq;
+    this.state.nextPulseAt = this.state.currentTurnEndsAt;
     this.syncState();
-    // Send an explicit roomInfo packet as soon as the timer starts so clients can
-    // run a smooth local 5 second card countdown between server pulses.
-    this.sendAllRoomInfo();
 
+    const windowNumber = this.turnSeq;
     this.pulseTimer = setTimeout(() => {
       this.pulseTimer = undefined;
       if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
-      // Pre-anchor the next visible card timer before sending hands from pulse().
-      // scheduleNextPulse() below will attach the actual timeout using the same window.
-      this.state.nextPulseAt = Date.now() + PULSE_MS;
+      if (windowNumber !== this.turnSeq) return;
       this.pulse();
-      if (this.state.phase === "playing" && this.state.roundStartsAt === 0) this.scheduleNextPulse(false);
+      if (this.state.phase === "playing" && this.state.roundStartsAt === 0) this.startPassWindow(true);
       else {
-        this.state.nextPulseAt = 0;
+        this.clearTurnClock();
         this.syncState();
         this.sendAllRoomInfo();
       }
-    }, delay);
+    }, PULSE_MS);
+
+    if (broadcast) {
+      this.sendAllRoomInfo();
+      this.sendAllHands();
+      this.scheduleBotFlips();
+    }
+  }
+
+  private clearTurnClock() {
+    this.state.nextPulseAt = 0;
+    this.state.currentTurnStartedAt = 0;
+    this.state.currentTurnEndsAt = 0;
+    this.state.turnDurationMs = PULSE_MS;
+    this.state.turnNumber = this.turnSeq;
   }
 
   private pulse() {
@@ -341,21 +354,38 @@ export class SpoonsRoom extends Room<SpoonsState> {
       return;
     }
 
-    // The pulse is the deadline. If a player has not flipped their new card,
-    // that exact face-down card is passed on untouched. The server does not
-    // auto-reveal it and it cannot count toward four-of-a-kind for that player.
+    // The pulse is the deadline. A human hand only changes if the player has
+    // flipped the new card and selected one of their original four hand cards.
+    // Otherwise the current new card (face-down or revealed) is passed left and
+    // the four kept cards remain unchanged.
     for (const id of order) {
       const p = this.players.get(id);
       const hand = this.hands.get(id) ?? [];
+      const currentNewId = this.lastReceived.get(id) ?? "";
       const unflippedId = this.unflippedNewCards.get(id);
+      const selectedId = this.selected.get(id) ?? "";
+      const selectedIsValid = !!selectedId && hand.some((card) => card.id === selectedId);
+
       if (unflippedId && hand.some((card) => card.id === unflippedId)) {
         this.selected.set(id, unflippedId);
         this.clearBotFlipTimer(id);
         continue;
       }
-      if (p?.isBot || !this.selected.has(id)) {
-        const pick = this.pickBotDiscard(hand);
-        if (pick) this.selected.set(id, pick.id);
+
+      if (p?.isBot) {
+        if (!selectedIsValid) {
+          const pick = this.chooseBotDiscard(id);
+          if (pick) this.selected.set(id, pick.id);
+        }
+        continue;
+      }
+
+      // Human timeout path: no server/bot-style decision is ever made for them.
+      // If the new card was flipped but no original hand card was chosen, pass
+      // the new card on and leave the human's existing four cards untouched.
+      if (!selectedIsValid || selectedId === currentNewId) {
+        const newCard = hand.find((card) => card.id === currentNewId) ?? hand[hand.length - 1];
+        if (newCard) this.selected.set(id, newCard.id);
       }
     }
 
@@ -365,8 +395,9 @@ export class SpoonsRoom extends Room<SpoonsState> {
       if (hand.length === 0) continue;
       const selectedId = this.selected.get(id);
       const idx = selectedId ? hand.findIndex((c) => c.id === selectedId) : -1;
-      const fallback = this.pickBotDiscard(hand);
-      const cardIndex = idx >= 0 ? idx : fallback ? hand.findIndex((c) => c.id === fallback.id) : hand.length - 1;
+      const currentNewId = this.lastReceived.get(id) ?? "";
+      const fallbackIndex = currentNewId ? hand.findIndex((c) => c.id === currentNewId) : hand.length - 1;
+      const cardIndex = idx >= 0 ? idx : fallbackIndex >= 0 ? fallbackIndex : hand.length - 1;
       const [card] = hand.splice(Math.max(0, cardIndex), 1);
       if (card) {
         outgoing.set(id, card);
@@ -390,15 +421,12 @@ export class SpoonsRoom extends Room<SpoonsState> {
 
     if (!this.state.scrambleActive) this.maybeAssistSlowRound(order);
 
-    this.turnSeq += 1;
     this.normalizeActiveHands(order);
-    this.sendAllHands();
-    this.scheduleBotFlips();
 
     if (!this.state.scrambleActive) {
       for (const id of order) {
         const p = this.players.get(id);
-        if (p?.isBot && this.hasFourOfKindRevealed(id) && Math.random() < 0.38) {
+        if (p?.isBot && this.hasFourOfKindRevealed(id)) {
           this.maybeScheduleBotFirstSpoon(id);
           break;
         }
@@ -413,14 +441,23 @@ export class SpoonsRoom extends Room<SpoonsState> {
     if (!p || p.eliminated || p.spectator || this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
     const hand = this.hands.get(playerId) ?? [];
     const unflippedId = this.unflippedNewCards.get(playerId);
+    const currentNewId = this.lastReceived.get(playerId) ?? "";
     if (unflippedId) {
-      this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "Flip the new card first, then choose a card to pass." });
+      this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "Flip the new card first, then choose one of your original 4 cards to pass." });
+      this.sendHand(playerId);
+      return;
+    }
+    if (cardId === currentNewId) {
+      this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "To keep the new card, choose one of your original 4 cards to pass. Or leave it and the new card will pass on." });
       this.sendHand(playerId);
       return;
     }
     if (hand.some((card) => card.id === cardId)) {
       this.selected.set(playerId, cardId);
       this.sendHand(playerId);
+      if (this.hasFourOfKindRevealed(playerId)) {
+        this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "Four of a kind! Click a silver spoon!" });
+      }
     }
   }
 
@@ -431,19 +468,19 @@ export class SpoonsRoom extends Room<SpoonsState> {
     if (!cardId) return;
     this.unflippedNewCards.delete(playerId);
     this.clearBotFlipTimer(playerId);
-    this.sendHand(playerId);
-    if (!silent && this.hasFourOfKindRevealed(playerId)) {
-      this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "Four of a kind! Click a silver spoon!" });
-    }
-    if (p.isBot && !this.state.scrambleActive && this.hasFourOfKindRevealed(playerId)) this.maybeScheduleBotFirstSpoon(playerId);
-  }
 
-  private ensureNewCardFlipped(playerId: string) {
-    const cardId = this.unflippedNewCards.get(playerId);
-    if (!cardId) return false;
-    this.unflippedNewCards.delete(playerId);
-    this.clearBotFlipTimer(playerId);
-    return true;
+    if (p.isBot) {
+      const pick = this.chooseBotDiscard(playerId);
+      if (pick) this.selected.set(playerId, pick.id);
+      this.sendAllHands();
+      if (!this.state.scrambleActive && this.hasFourOfKindRevealed(playerId)) this.maybeScheduleBotFirstSpoon(playerId);
+      return;
+    }
+
+    this.sendHand(playerId);
+    if (!silent) {
+      this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "New card flipped. Tap one of your original 4 cards to keep it." });
+    }
   }
 
   private clearBotFlipTimer(playerId: string) {
@@ -453,8 +490,23 @@ export class SpoonsRoom extends Room<SpoonsState> {
   }
 
   private hasFourOfKindRevealed(playerId: string): boolean {
-    if (this.unflippedNewCards.has(playerId)) return false;
-    return hasFourOfKind(this.hands.get(playerId) ?? []);
+    const hand = this.hands.get(playerId) ?? [];
+    if (hand.length < 4) return false;
+    const currentNewId = this.lastReceived.get(playerId) ?? "";
+    const selectedId = this.selected.get(playerId) ?? "";
+
+    // During a decision window, the incoming card is a separate 5th card. It only
+    // counts toward four-of-a-kind after the player/bot has chosen an original
+    // hand card to pass. If no such choice has been made, only the kept 4-card
+    // hand is checked, so an unflipped or merely flipped new card cannot help.
+    if (currentNewId && hand.some((card) => card.id === currentNewId)) {
+      if (selectedId && selectedId !== currentNewId && hand.some((card) => card.id === selectedId)) {
+        return hasFourOfKind(hand.filter((card) => card.id !== selectedId));
+      }
+      return hasFourOfKind(hand.filter((card) => card.id !== currentNewId));
+    }
+
+    return hasFourOfKind(hand);
   }
 
   private scheduleBotFlips() {
@@ -463,11 +515,10 @@ export class SpoonsRoom extends Room<SpoonsState> {
       const p = this.players.get(id);
       if (!p?.isBot || p.eliminated || p.spectator || !this.unflippedNewCards.has(id)) continue;
       if (this.botFlipTimers.has(id)) continue;
-      const delay = 650 + Math.floor(Math.random() * 2100);
+      const delay = 350 + Math.floor(Math.random() * 1100);
       const timer = setTimeout(() => {
         this.botFlipTimers.delete(id);
         if (this.state.phase === "playing" && this.state.roundStartsAt === 0) this.flipNewCard(id, true);
-        this.sendAllHands();
       }, delay);
       this.botFlipTimers.set(id, timer);
     }
@@ -482,7 +533,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     const p = this.players.get(playerId);
     if (!p?.isBot || this.state.scrambleActive || this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
     if (!this.hasFourOfKindRevealed(playerId)) return;
-    const delay = 2200 + Math.floor(Math.random() * 3600);
+    const delay = 300 + Math.floor(Math.random() * 500);
     const timer = setTimeout(() => {
       if (this.state.phase === "playing" && !this.state.scrambleActive && this.state.roundStartsAt === 0) this.grabSpoon(playerId);
     }, delay);
@@ -501,12 +552,13 @@ export class SpoonsRoom extends Room<SpoonsState> {
     }
 
     if (!this.state.scrambleActive) {
-      if (this.unflippedNewCards.has(playerId)) {
-        if (!p.isBot) this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "Flip the new card first." });
-        return;
-      }
       if (!this.hasFourOfKindRevealed(playerId)) {
-        if (!p.isBot) this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "You need four of a kind before you can take the first spoon." });
+        if (!p.isBot) {
+          const message = this.unflippedNewCards.has(playerId)
+            ? "You need four of a kind in your kept hand. The face-down new card does not count."
+            : "You need four of a kind before you can take the first spoon.";
+          this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message });
+        }
         return;
       }
       this.state.scrambleActive = true;
@@ -564,7 +616,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
       .filter((p): p is PlayerData => !!p && p.isBot && !p.eliminated && !p.spectator && !p.hasSpoon);
 
     bots.forEach((bot, index) => {
-      const delay = 3200 + index * 750 + Math.floor(Math.random() * 4200);
+      const delay = 600 + index * 180 + Math.floor(Math.random() * 1400);
       const timer = setTimeout(() => {
         if (this.state.phase === "playing" && this.state.scrambleActive && this.state.roundStartsAt === 0) this.grabSpoon(bot.id);
       }, delay);
@@ -621,6 +673,10 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.takenSpoonSlots.clear();
     this.state.takenSpoonsJson = "[]";
     this.state.nextPulseAt = 0;
+    this.state.currentTurnStartedAt = 0;
+    this.state.currentTurnEndsAt = 0;
+    this.state.turnDurationMs = PULSE_MS;
+    this.state.turnNumber = this.turnSeq;
     this.state.roundStartsAt = Date.now() + BETWEEN_ROUND_MS;
     const cleanedMessage = message.trim().replace(/\s+$/, "");
     this.state.roundMessage = `${cleanedMessage}\nNext round starts with ${stillIn.length} players.`;
@@ -673,6 +729,10 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.state.roundStartsAt = 0;
     this.state.roundMessage = "";
     this.state.nextPulseAt = 0;
+    this.state.currentTurnStartedAt = 0;
+    this.state.currentTurnEndsAt = 0;
+    this.state.turnDurationMs = PULSE_MS;
+    this.state.turnNumber = this.turnSeq;
     this.state.spoonsAvailable = 0;
     this.state.spoonsTaken = 0;
     this.takenSpoonSlots.clear();
@@ -742,8 +802,13 @@ export class SpoonsRoom extends Room<SpoonsState> {
       newCardFaceDown: !!hiddenNewCardId,
       selectedCardId: spectatorView ? "" : this.selected.get(playerId) ?? "",
       pulseMs: PULSE_MS,
+      serverNow: Date.now(),
       nextPulseAt: this.state.nextPulseAt,
       nextPulseMs: this.state.nextPulseAt > 0 ? Math.max(0, this.state.nextPulseAt - Date.now()) : 0,
+      currentTurnStartedAt: this.state.currentTurnStartedAt,
+      currentTurnEndsAt: this.state.currentTurnEndsAt,
+      turnDurationMs: this.state.turnDurationMs,
+      turnNumber: this.state.turnNumber,
       turnSeq: this.turnSeq,
       spectatorView,
       handOwnerName: owner?.name ?? "Dealer"
@@ -855,8 +920,13 @@ export class SpoonsRoom extends Room<SpoonsState> {
       takenSpoons: [...this.takenSpoonSlots],
       takenSpoonsJson: JSON.stringify([...this.takenSpoonSlots]),
       scrambleActive: this.state.scrambleActive,
+      serverNow: Date.now(),
       nextPulseAt: this.state.nextPulseAt,
       nextPulseMs: this.state.nextPulseAt > 0 ? Math.max(0, this.state.nextPulseAt - Date.now()) : 0,
+      currentTurnStartedAt: this.state.currentTurnStartedAt,
+      currentTurnEndsAt: this.state.currentTurnEndsAt,
+      turnDurationMs: this.state.turnDurationMs,
+      turnNumber: this.state.turnNumber,
       firstSpoonId: this.state.firstSpoonId,
       loserId: this.state.loserId,
       championId: this.state.championId,
@@ -1000,7 +1070,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
       const bot = activeBots[Math.floor(Math.random() * activeBots.length)];
       this.giveFourOfKind(bot.id);
       this.lateBotAssistUsed = true;
-      const delay = 3600 + Math.floor(Math.random() * 3200);
+      const delay = 400 + Math.floor(Math.random() * 600);
       const timer = setTimeout(() => {
         if (this.state.phase === "playing" && !this.state.scrambleActive && this.state.roundStartsAt === 0) this.grabSpoon(bot.id);
       }, delay);
@@ -1039,21 +1109,44 @@ export class SpoonsRoom extends Room<SpoonsState> {
     return CARD_RANKS[Math.floor(Math.random() * CARD_RANKS.length)];
   }
 
-  private pickBotDiscard(hand: Card[]): Card | undefined {
+  private chooseBotDiscard(playerId: string): Card | undefined {
+    const hand = this.hands.get(playerId) ?? [];
     if (hand.length === 0) return undefined;
-    const counts = new Map<string, number>();
-    for (const c of hand) counts.set(c.rank, (counts.get(c.rank) ?? 0) + 1);
-    let bestRank = hand[0].rank;
-    let bestCount = 0;
-    for (const [rank, count] of counts) {
-      if (count > bestCount) {
-        bestRank = rank;
-        bestCount = count;
+    const currentNewId = this.lastReceived.get(playerId) ?? "";
+    const currentNew = hand.find((card) => card.id === currentNewId);
+    if (!currentNew) return this.chooseWeakestCard(hand);
+
+    let bestCard = currentNew;
+    let bestScore = -1;
+    for (const candidate of hand) {
+      const kept = hand.filter((card) => card.id !== candidate.id);
+      const score = this.handStrengthScore(kept) + (candidate.id === currentNewId ? 0.02 : 0);
+      if (score > bestScore) {
+        bestScore = score;
+        bestCard = candidate;
       }
     }
-    const discardable = hand.filter((c) => c.rank !== bestRank);
-    const pool = discardable.length ? discardable : hand;
-    return pool[Math.floor(Math.random() * pool.length)];
+    return bestCard;
+  }
+
+  private chooseWeakestCard(hand: Card[]): Card | undefined {
+    if (hand.length === 0) return undefined;
+    const counts = this.rankCounts(hand);
+    const sorted = [...hand].sort((a, b) => (counts.get(a.rank) ?? 0) - (counts.get(b.rank) ?? 0));
+    return sorted[0];
+  }
+
+  private handStrengthScore(cards: Card[]): number {
+    const counts = [...this.rankCounts(cards).values()].sort((a, b) => b - a);
+    const best = counts[0] ?? 0;
+    const second = counts[1] ?? 0;
+    return best * 10 + second;
+  }
+
+  private rankCounts(cards: Card[]): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const c of cards) counts.set(c.rank, (counts.get(c.rank) ?? 0) + 1);
+    return counts;
   }
 
   private cleanName(value?: string) {

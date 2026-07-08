@@ -50,6 +50,10 @@ export class SpoonsState extends Schema {
   @type("number") spoonsTaken = 0;
   @type("boolean") scrambleActive = false;
   @type("number") nextPulseAt = 0;
+  @type("number") currentTurnStartedAt = 0;
+  @type("number") currentTurnEndsAt = 0;
+  @type("number") turnDurationMs = 5000;
+  @type("number") turnNumber = 0;
   @type("number") activeCount = 0;
   @type("number") eliminatedCount = 0;
   @type("number") revision = 0;
