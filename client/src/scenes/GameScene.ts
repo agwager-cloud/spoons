@@ -571,7 +571,7 @@ export class GameScene extends Phaser.Scene {
     });
 
     const instruction = readOnly
-      ? "Spectators can watch the dealer hand while the remaining players continue."
+      ? "Spectator view follows the most recent active hand while the remaining players continue."
       : "Flip or swap quickly — cards auto-pass.";
     this.objects.push(this.add.text(640, 692, instruction, {
       fontFamily: "Arial",

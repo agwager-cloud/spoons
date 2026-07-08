@@ -23,6 +23,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
   private selected = new Map<string, string>();
   private lastReceived = new Map<string, string>();
   private unflippedNewCards = new Map<string, string>();
+  private spectatorWatchTargets = new Map<string, string>();
   private drawPile: Card[] = [];
   private discardPile: Card[] = [];
   private activeOrder: string[] = [];
@@ -139,6 +140,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
         this.selected.delete(p.id);
         this.lastReceived.delete(p.id);
         this.unflippedNewCards.delete(p.id);
+        this.spectatorWatchTargets.delete(p.id);
         this.activeOrder = this.activeOrder.filter((id) => id !== p.id);
         if (this.state.scrambleActive) this.finishScrambleIfReady();
         else this.checkForFinalOrScheduleRound(`${p.name} disconnected and is out.`);
@@ -239,6 +241,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.discardPile = [];
     this.seedOpeningHands(current);
     this.markCurrentNewCardsFaceDown();
+    this.resetSpectatorWatchTargets(dealerId);
 
     this.recount();
     this.startPassWindow(true);
@@ -261,6 +264,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.selected.clear();
     this.lastReceived.clear();
     this.unflippedNewCards.clear();
+    this.spectatorWatchTargets.clear();
     this.drawPile = [];
     this.discardPile = [];
     this.activeOrder = [];
@@ -471,6 +475,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     if (hand.some((card) => card.id === cardId)) {
       this.selected.set(playerId, cardId);
       this.sendHand(playerId);
+      this.sendSpectatorHandsFor(playerId);
       if (this.hasFourOfKindRevealed(playerId)) {
         this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "Four of a kind! Click a silver spoon!" });
       }
@@ -488,12 +493,14 @@ export class SpoonsRoom extends Room<SpoonsState> {
     if (p.isBot) {
       const pick = this.chooseBotDiscard(playerId);
       if (pick) this.selected.set(playerId, pick.id);
+      this.sendSpectatorHandsFor(playerId);
       this.sendAllHands();
       if (!this.state.scrambleActive && this.hasFourOfKindRevealed(playerId)) this.maybeScheduleBotFirstSpoon(playerId);
       return;
     }
 
     this.sendHand(playerId);
+    this.sendSpectatorHandsFor(playerId);
     if (!silent) {
       this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "New card flipped. Tap one of your original 4 cards to keep it." });
     }
@@ -822,6 +829,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.lastReceived.set(targetId, card.id);
     this.unflippedNewCards.set(targetId, card.id);
     this.sendHand(targetId);
+    this.sendSpectatorHandsFor(targetId);
   }
 
   private bestThreeOfKindRank(playerId: string): string {
@@ -869,13 +877,12 @@ export class SpoonsRoom extends Room<SpoonsState> {
     }
   }
 
-  private sendHand(playerId: string) {
+  private sendHand(playerId: string, preferredOwnerId = "") {
     const client = this.clients.find((c) => c.sessionId === playerId);
     if (!client) return;
     const p = this.players.get(playerId);
-    const dealer = this.players.get(this.state.dealerId);
     const spectatorView = !!p && this.state.phase === "playing" && (p.spectator || p.eliminated);
-    const handOwnerId = spectatorView ? (dealer?.id ?? this.activeOrder[0] ?? playerId) : playerId;
+    const handOwnerId = spectatorView ? this.resolveSpectatorHandOwner(playerId, preferredOwnerId) : playerId;
     const owner = this.players.get(handOwnerId);
     if (this.activeOrder.includes(handOwnerId)) this.normalizeActiveHands([handOwnerId]);
     const hiddenNewCardId = this.unflippedNewCards.get(handOwnerId) ?? "";
@@ -907,6 +914,49 @@ export class SpoonsRoom extends Room<SpoonsState> {
 
   private sendAllHands() {
     for (const client of this.clients) this.sendHand(client.sessionId);
+  }
+
+  private sendSpectatorHandsFor(ownerId: string) {
+    if (!this.isActiveHandOwner(ownerId)) return;
+    for (const client of this.clients) {
+      const p = this.players.get(client.sessionId);
+      if (p && this.state.phase === "playing" && (p.spectator || p.eliminated)) {
+        this.sendHand(client.sessionId, ownerId);
+      }
+    }
+  }
+
+  private resolveSpectatorHandOwner(spectatorId: string, preferredOwnerId = "") {
+    if (preferredOwnerId && this.isActiveHandOwner(preferredOwnerId)) {
+      this.spectatorWatchTargets.set(spectatorId, preferredOwnerId);
+      return preferredOwnerId;
+    }
+
+    const currentTarget = this.spectatorWatchTargets.get(spectatorId) ?? "";
+    if (currentTarget && this.isActiveHandOwner(currentTarget)) return currentTarget;
+
+    const fallback = this.isActiveHandOwner(this.state.dealerId)
+      ? this.state.dealerId
+      : this.activeOrder.find((id) => this.isActiveHandOwner(id)) ?? spectatorId;
+    if (fallback !== spectatorId) this.spectatorWatchTargets.set(spectatorId, fallback);
+    return fallback;
+  }
+
+  private isActiveHandOwner(playerId: string) {
+    const p = this.players.get(playerId);
+    return !!p && this.activeOrder.includes(playerId) && !p.eliminated && !p.spectator && (p.connected || p.isBot);
+  }
+
+  private resetSpectatorWatchTargets(defaultOwnerId = "") {
+    this.spectatorWatchTargets.clear();
+    const ownerId = this.isActiveHandOwner(defaultOwnerId)
+      ? defaultOwnerId
+      : this.activeOrder.find((id) => this.isActiveHandOwner(id)) ?? "";
+    if (!ownerId) return;
+    for (const client of this.clients) {
+      const p = this.players.get(client.sessionId);
+      if (p && (p.spectator || p.eliminated)) this.spectatorWatchTargets.set(p.id, ownerId);
+    }
   }
 
   private addBots(mode: "eight" | "fill") {
@@ -1065,6 +1115,10 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.selected.delete(playerId);
     this.lastReceived.delete(playerId);
     this.unflippedNewCards.delete(playerId);
+    this.spectatorWatchTargets.delete(playerId);
+    for (const [spectatorId, targetId] of [...this.spectatorWatchTargets.entries()]) {
+      if (targetId === playerId) this.spectatorWatchTargets.delete(spectatorId);
+    }
     const flipTimer = this.botFlipTimers.get(playerId);
     if (flipTimer) clearTimeout(flipTimer);
     this.botFlipTimers.delete(playerId);
@@ -1187,6 +1241,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.lastReceived.set(playerId, newId);
     if (newId) this.unflippedNewCards.set(playerId, newId);
     this.sendHand(playerId);
+    this.sendSpectatorHandsFor(playerId);
     this.scheduleBotFlips();
   }
 
