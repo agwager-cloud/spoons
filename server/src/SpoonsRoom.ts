@@ -292,12 +292,16 @@ export class SpoonsRoom extends Room<SpoonsState> {
     if (this.pulseTimer) clearInterval(this.pulseTimer);
     this.state.nextPulseAt = Date.now() + PULSE_MS;
     this.syncState();
+    // Send an explicit roomInfo packet as soon as the timer starts so clients do
+    // not render the new-card timer as 0s while waiting for schema sync.
+    this.sendAllRoomInfo();
     this.pulseTimer = setInterval(() => {
       if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
       this.pulse();
       if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
       this.state.nextPulseAt = Date.now() + PULSE_MS;
       this.syncState();
+      this.sendAllRoomInfo();
     }, PULSE_MS);
   }
 
@@ -577,7 +581,8 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.state.takenSpoonsJson = "[]";
     this.state.nextPulseAt = 0;
     this.state.roundStartsAt = Date.now() + BETWEEN_ROUND_MS;
-    this.state.roundMessage = `${message} Next round begins with ${stillIn.length} players.`;
+    const cleanedMessage = message.trim().replace(/\s+$/, "");
+    this.state.roundMessage = `${cleanedMessage}\nNext round starts with ${stillIn.length} players.`;
     this.selected.clear();
     this.recount();
     this.sendAllRoomInfo();
@@ -778,6 +783,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
       takenSpoonsJson: JSON.stringify([...this.takenSpoonSlots]),
       scrambleActive: this.state.scrambleActive,
       nextPulseAt: this.state.nextPulseAt,
+      nextPulseMs: this.state.nextPulseAt > 0 ? Math.max(0, this.state.nextPulseAt - Date.now()) : 0,
       firstSpoonId: this.state.firstSpoonId,
       loserId: this.state.loserId,
       championId: this.state.championId,

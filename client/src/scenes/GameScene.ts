@@ -165,7 +165,7 @@ export class GameScene extends Phaser.Scene {
       this.countdownNumber?.setText(String(Math.max(0, Math.ceil(countdownMs / 1000))));
       return;
     }
-    const remaining = Math.max(0, Math.ceil((state.nextPulseAt - Date.now()) / 100) / 10);
+    const remaining = this.getPulseSecondsRemainingPrecise();
     this.pulseText.setText(state.scrambleActive ? `SPOON SCRAMBLE! Passes continue in ${remaining.toFixed(1)}s` : `Next pass in ${remaining.toFixed(1)}s`);
     if (this.cardTimerText?.active) {
       this.cardTimerText.setText(`${Math.max(0, Math.ceil(remaining))}s`);
@@ -355,11 +355,13 @@ export class GameScene extends Phaser.Scene {
           this.tweens.add({ targets: spoon, scaleX: spoon.scaleX * 1.08, scaleY: spoon.scaleY * 1.08, yoyo: true, repeat: -1, duration: 420 });
         }
         this.objects.push(spoon);
-      } else {
-        const outline = this.add.ellipse(x, y, spoonW * 0.85, spoonH * 0.88, 0xffffff, 0.02)
-          .setStrokeStyle(2, 0xdbeafe, available ? 0.65 : 0.42)
+      } else if (available) {
+        // Fallback only if the sprite fails to load. Taken spoons deliberately leave
+        // empty space so they look like they have disappeared.
+        const fallback = this.add.ellipse(x, y, spoonW * 0.7, spoonH * 0.82, 0xcbd5e1, 0.85)
+          .setStrokeStyle(2, 0xffffff, 0.7)
           .setRotation(-0.45);
-        this.objects.push(outline);
+        this.objects.push(fallback);
       }
     }
 
@@ -458,9 +460,13 @@ export class GameScene extends Phaser.Scene {
         const badgeColour = faceDown ? 0xf97316 : 0xf59e0b;
         const badge = this.add.rectangle(x, y - 83, 82, 26, badgeColour, 1).setStrokeStyle(2, 0xffffff, 0.95);
         const badgeText = this.add.text(x, y - 83, faceDown ? "FLIP" : "NEW", { fontFamily: "Arial", fontSize: "15px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
-        const timerBubble = this.add.rectangle(x + 58, y - 83, 42, 26, 0x102a43, 0.92).setStrokeStyle(2, 0xffffff, 0.8);
-        this.cardTimerText = this.add.text(x + 58, y - 83, `${pulseSeconds}s`, { fontFamily: "Arial", fontSize: "14px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
-        this.objects.push(badge, badgeText, timerBubble, this.cardTimerText);
+        this.objects.push(badge, badgeText);
+        if (!readOnly) {
+          const seconds = this.getPulseSecondsRemaining();
+          const timerBubble = this.add.rectangle(x + 58, y - 83, 42, 26, 0x102a43, 0.92).setStrokeStyle(2, 0xffffff, 0.8);
+          this.cardTimerText = this.add.text(x + 58, y - 83, `${seconds}s`, { fontFamily: "Arial", fontSize: "14px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
+          this.objects.push(timerBubble, this.cardTimerText);
+        }
       }
       if (selected) {
         const passBadge = this.add.rectangle(x, y + 83, 96, 26, 0xf97316, 1).setStrokeStyle(2, 0xffffff, 0.95);
@@ -486,10 +492,26 @@ export class GameScene extends Phaser.Scene {
     }).setOrigin(0.5));
   }
 
-  private getPulseSecondsRemaining() {
+  private getPulseSecondsRemainingPrecise() {
+    const info = Net.lastRoomInfo ?? {};
+    const receivedAt = Number(info._receivedAt ?? 0);
+    const fromInfoMs = Number(info.nextPulseMs);
+    if (Number.isFinite(fromInfoMs) && fromInfoMs > 0 && receivedAt > 0) {
+      return Math.max(0, Math.ceil((fromInfoMs - (Date.now() - receivedAt)) / 100) / 10);
+    }
+
+    const infoAt = Number(info.nextPulseAt ?? 0);
+    if (Number.isFinite(infoAt) && infoAt > 0) {
+      return Math.max(0, Math.ceil((infoAt - Date.now()) / 100) / 10);
+    }
+
     const state: any = Net.room?.state;
-    const value = Number(state?.nextPulseAt ?? 0) - Date.now();
-    return Math.max(0, Math.ceil(value / 1000));
+    const stateAt = Number(state?.nextPulseAt ?? 0);
+    return Math.max(0, Math.ceil((stateAt - Date.now()) / 100) / 10);
+  }
+
+  private getPulseSecondsRemaining() {
+    return Math.max(0, Math.ceil(this.getPulseSecondsRemainingPrecise()));
   }
 
   private drawRoundInfo(roster: PlayerLike[], me?: PlayerLike) {
@@ -532,16 +554,29 @@ export class GameScene extends Phaser.Scene {
     const remaining = Math.max(0, Math.ceil(countdownMs / 1000));
     const c = this.add.container(0, 0);
     c.add(this.add.rectangle(640, 360, 1280, 720, 0x000000, 0.18));
-    c.add(this.add.rectangle(640, 356, 560, 170, 0xffffff, 0.94).setStrokeStyle(4, 0xfacc15, 0.9));
-    c.add(this.add.text(640, 318, message, {
+    c.add(this.add.rectangle(640, 356, 600, 180, 0xffffff, 0.94).setStrokeStyle(4, 0xfacc15, 0.9));
+    const lines = String(message).split("\n").filter(Boolean);
+    const mainLine = lines[0] ?? message;
+    const secondLine = lines.slice(1).join(" ");
+    c.add(this.add.text(640, 300, mainLine, {
       fontFamily: "Arial",
-      fontSize: "24px",
+      fontSize: "26px",
       color: "#102a43",
       fontStyle: "bold",
       align: "center",
-      wordWrap: { width: 510 }
+      wordWrap: { width: 550 }
     }).setOrigin(0.5));
-    this.countdownNumber = this.add.text(640, 392, String(remaining), {
+    if (secondLine) {
+      c.add(this.add.text(640, 335, secondLine, {
+        fontFamily: "Arial",
+        fontSize: "22px",
+        color: "#41556e",
+        fontStyle: "bold",
+        align: "center",
+        wordWrap: { width: 550 }
+      }).setOrigin(0.5));
+    }
+    this.countdownNumber = this.add.text(640, 402, String(remaining), {
       fontFamily: "Arial",
       fontSize: "54px",
       color: "#f97316",

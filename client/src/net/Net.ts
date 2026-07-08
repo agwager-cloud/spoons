@@ -36,7 +36,7 @@ class NetService {
       return `${protocol}://${host}:2567`;
     }
 
-    return "";
+    return "wss://spoons-67eu.onrender.com";
   }
 
   private getClient(): Client {
