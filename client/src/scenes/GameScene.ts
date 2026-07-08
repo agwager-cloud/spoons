@@ -88,6 +88,10 @@ export class GameScene extends Phaser.Scene {
   private turnTimerDeadlineMs = 0;
   private turnTimerDurationMs = 5000;
   private lastHandNewCardId = "";
+  private activeTimerKey = "";
+  private activeTimerStartedAt = 0;
+  private activeTimerDurationMs = 5000;
+  private activeTimerInitialRemainingMs = 5000;
   private spectatorHand = false;
   private handOwnerName = "Dealer";
   private objects: Phaser.GameObjects.GameObject[] = [];
@@ -179,13 +183,8 @@ export class GameScene extends Phaser.Scene {
       return;
     }
     const scrambleActive = Boolean(Net.lastRoomInfo?.scrambleActive ?? state.scrambleActive);
-    if (scrambleActive) {
-      this.pulseText.setText("SPOON SCRAMBLE!");
-      this.updateVisibleCardTimer();
-      return;
-    }
     const remaining = this.getPulseSecondsRemainingPrecise();
-    this.pulseText.setText(`Next pass in ${remaining.toFixed(1)}s`);
+    this.pulseText.setText(scrambleActive ? `Keep passing — next pass in ${remaining.toFixed(1)}s` : `Next pass in ${remaining.toFixed(1)}s`);
     this.updateVisibleCardTimer();
   }
 
@@ -195,44 +194,55 @@ export class GameScene extends Phaser.Scene {
     const duration = Number(payload?.pulseMs ?? Net.lastRoomInfo?.pulseMs ?? 5000) || 5000;
     const incomingSeqRaw = payload?.turnSeq ?? Net.lastRoomInfo?.turnSeq ?? 0;
     const incomingSeq = Number.isFinite(Number(incomingSeqRaw)) ? Number(incomingSeqRaw) : this.turnSeq;
-    const nextPulseMsRaw = Number(payload?.nextPulseMs ?? Net.lastRoomInfo?.nextPulseMs ?? 0);
-    const remainingMs = Number.isFinite(nextPulseMsRaw) && nextPulseMsRaw > 0
-      ? Math.min(duration, nextPulseMsRaw)
-      : duration;
+    const key = `${incomingSeq}`;
 
-    const cardChanged = incomingNewCardId !== this.lastHandNewCardId;
-    const turnChanged = incomingSeq !== this.turnSeq;
-    const timerMissing = this.turnTimerDeadlineMs <= 0;
-
-    // Critical timer rule: only reset the visible 5 second card timer when a
-    // genuinely new pass window begins. Do not reset it when the server re-sends
-    // the same hand because a bot flipped, a spoon was clicked, or roomInfo updated.
-    if (cardChanged || turnChanged || timerMissing) {
+    // Full timer rewrite: the visible countdown is now a purely local stopwatch
+    // anchored once per server turnSeq. Repeated hand packets from bot flips,
+    // spoon grabs, room-info refreshes, or spectator updates must NOT reset it.
+    if (key !== this.activeTimerKey) {
+      const nextPulseMsRaw = Number(payload?.nextPulseMs ?? Net.lastRoomInfo?.nextPulseMs ?? 0);
+      const remainingMs = Number.isFinite(nextPulseMsRaw) && nextPulseMsRaw > 250
+        ? Math.min(duration, nextPulseMsRaw)
+        : duration;
+      this.activeTimerKey = key;
       this.turnSeq = incomingSeq;
-      this.localPulseKey = `${incomingSeq}:${incomingNewCardId}`;
+      this.localPulseKey = `${key}:${incomingNewCardId}`;
       this.localPulseDuration = duration;
       this.turnTimerDurationMs = duration;
-      this.turnTimerDeadlineMs = performance.now() + remainingMs;
+      this.activeTimerDurationMs = duration;
+      this.activeTimerInitialRemainingMs = remainingMs;
+      this.activeTimerStartedAt = performance.now();
+      this.turnTimerDeadlineMs = this.activeTimerStartedAt + remainingMs;
       this.localPulseDeadline = Date.now() + remainingMs;
-      this.lastHandNewCardId = incomingNewCardId;
     }
+
+    this.lastHandNewCardId = incomingNewCardId;
   }
 
   private anchorPulseFromRoomInfo(info: any) {
     const roundStartsAt = Number(info?.roundStartsAt ?? 0);
-    if (roundStartsAt > 0 || !this.newCardId) return;
+    if (roundStartsAt > 0) return;
 
     const incomingSeqRaw = info?.turnSeq ?? this.turnSeq;
     const incomingSeq = Number.isFinite(Number(incomingSeqRaw)) ? Number(incomingSeqRaw) : this.turnSeq;
+    const key = `${incomingSeq}`;
     const nextPulseMs = Number(info?.nextPulseMs ?? 0);
-    if (incomingSeq !== this.turnSeq && nextPulseMs > 0) {
+
+    // Only anchor from roomInfo when a genuinely new pass window begins and the
+    // matching hand packet has not already done it. Never reset the same turn.
+    if (key !== this.activeTimerKey && nextPulseMs > 250) {
       const duration = Number(info?.pulseMs ?? 5000) || 5000;
+      const remainingMs = Math.min(duration, nextPulseMs);
+      this.activeTimerKey = key;
       this.turnSeq = incomingSeq;
-      this.localPulseKey = `${incomingSeq}:${this.newCardId}`;
+      this.localPulseKey = `${key}:${this.newCardId || "pending"}`;
       this.localPulseDuration = duration;
       this.turnTimerDurationMs = duration;
-      this.turnTimerDeadlineMs = performance.now() + Math.min(duration, nextPulseMs);
-      this.localPulseDeadline = Date.now() + Math.min(duration, nextPulseMs);
+      this.activeTimerDurationMs = duration;
+      this.activeTimerInitialRemainingMs = remainingMs;
+      this.activeTimerStartedAt = performance.now();
+      this.turnTimerDeadlineMs = this.activeTimerStartedAt + remainingMs;
+      this.localPulseDeadline = Date.now() + remainingMs;
     }
   }
 
@@ -318,9 +328,11 @@ export class GameScene extends Phaser.Scene {
         ? "You joined during an active game. You are spectating until the next game."
         : me?.eliminated
           ? `You are out. Spectator view: watching ${this.handOwnerName}'s hand.`
-          : hasSpoon
-            ? "You have a spoon. Keep watching until one player misses out."
-            : scrambleActive
+          : hasSpoon && scrambleActive
+            ? "You have a spoon. Keep passing and bluffing while the others watch the spoons."
+            : hasSpoon
+              ? "You have a spoon. Keep playing your hand while the round continues."
+              : scrambleActive
               ? "A spoon has been taken. Click one of the remaining spoons before they run out."
               : this.newCardFaceDown
               ? "Tap FLIP on the new card, then choose one of your 5 cards to pass left."
@@ -344,14 +356,12 @@ export class GameScene extends Phaser.Scene {
       shadow: { offsetX: 0, offsetY: 3, color: "#00162e", blur: 5, fill: true }
     }).setOrigin(0.5));
 
-    const readOnly = countdownActive || !!me?.spectator || !!me?.eliminated || hasSpoon;
+    const readOnly = countdownActive || !!me?.spectator || !!me?.eliminated;
     const handTitle = this.spectatorHand || me?.spectator || me?.eliminated
       ? `${this.handOwnerName.toUpperCase()}'S HAND — spectator view`
-      : hasSpoon
-        ? "YOUR HAND — you already have a spoon"
-        : this.newCardFaceDown
-          ? "YOUR HAND — tap FLIP, then choose a card"
-          : "YOUR HAND — tap one card to pass left";
+      : this.newCardFaceDown
+        ? "YOUR HAND — tap FLIP, then choose a card"
+        : "YOUR HAND — tap one card to pass left";
     this.drawHand(readOnly, handTitle);
 
     this.drawRoundInfo(roster, me);
@@ -562,7 +572,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   private getPulseMsRemaining() {
-    if (this.turnTimerDeadlineMs > 0) return Math.max(0, this.turnTimerDeadlineMs - performance.now());
+    if (this.activeTimerStartedAt > 0) {
+      const elapsed = performance.now() - this.activeTimerStartedAt;
+      return Math.max(0, this.activeTimerInitialRemainingMs - elapsed);
+    }
 
     const info = Net.lastRoomInfo ?? {};
     const receivedAt = Number(info._receivedAt ?? 0);

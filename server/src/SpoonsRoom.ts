@@ -297,7 +297,9 @@ export class SpoonsRoom extends Room<SpoonsState> {
   }
 
   private scheduleNextPulse(resetDeadline = true) {
-    if (this.state.phase !== "playing" || this.state.roundStartsAt > 0 || this.state.scrambleActive) {
+    // Keep the card-passing pulse running even after the first spoon is taken.
+    // This lets players keep flipping/passing and bluffing while the spoon scramble is live.
+    if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) {
       this.state.nextPulseAt = 0;
       this.syncState();
       this.sendAllRoomInfo();
@@ -315,17 +317,11 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.pulseTimer = setTimeout(() => {
       this.pulseTimer = undefined;
       if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
-      if (this.state.scrambleActive) {
-        this.state.nextPulseAt = 0;
-        this.syncState();
-        this.sendAllRoomInfo();
-        return;
-      }
       // Pre-anchor the next visible card timer before sending hands from pulse().
       // scheduleNextPulse() below will attach the actual timeout using the same window.
       this.state.nextPulseAt = Date.now() + PULSE_MS;
       this.pulse();
-      if (this.state.phase === "playing" && this.state.roundStartsAt === 0 && !this.state.scrambleActive) this.scheduleNextPulse(false);
+      if (this.state.phase === "playing" && this.state.roundStartsAt === 0) this.scheduleNextPulse(false);
       else {
         this.state.nextPulseAt = 0;
         this.syncState();
@@ -395,6 +391,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     if (!this.state.scrambleActive) this.maybeAssistSlowRound(order);
 
     this.turnSeq += 1;
+    this.normalizeActiveHands(order);
     this.sendAllHands();
     this.scheduleBotFlips();
 
@@ -513,20 +510,17 @@ export class SpoonsRoom extends Room<SpoonsState> {
         return;
       }
       this.state.scrambleActive = true;
-      this.state.nextPulseAt = 0;
+      // Do NOT stop the pulse timer here. The game should keep flipping and passing
+      // while spoons disappear, so players can bluff instead of being tipped off by
+      // the card timer freezing.
       this.state.firstSpoonId = playerId;
       this.state.dealerId = playerId;
       p.firstSpoon = true;
       p.score += 1;
-      // Once spoons are live, freeze card passing so players do not see their
-      // hands randomly change into four of a kind during the scramble.
-      if (this.pulseTimer) clearTimeout(this.pulseTimer);
-      this.pulseTimer = undefined;
-      this.selected.clear();
       // Clear any delayed first-spoon bot attempts before starting the slower scramble timers.
       this.clearBotScrambleTimers();
-      this.broadcast("toast", { message: `${p.name} got four of a kind — spoons are live!` });
       this.sendAllHands();
+      this.sendAllRoomInfo();
     }
 
     if (this.state.spoonsTaken >= this.state.spoonsAvailable || this.takenSpoonSlots.has(slot)) return;
@@ -604,7 +598,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
         this.activeOrder = this.activeOrder.filter((id) => id !== loser.id);
       }
       this.clearBotScrambleTimers();
-      if (this.pulseTimer) clearInterval(this.pulseTimer);
+      if (this.pulseTimer) clearTimeout(this.pulseTimer);
       this.pulseTimer = undefined;
       this.checkForFinalOrScheduleRound(loser ? `${loser.name} is out.` : "Round complete.");
     }
@@ -697,6 +691,34 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.sendAllRoomInfo();
   }
 
+  private normalizeActiveHands(order: string[] = this.activeOrder) {
+    // Defensive repair for rare edge cases during disconnects / scramble timing.
+    // Every active player should always have exactly 5 cards: four kept cards plus one current new card.
+    for (const id of order) {
+      const p = this.players.get(id);
+      if (!p || p.eliminated || p.spectator || !(p.connected || p.isBot)) continue;
+      const hand = this.hands.get(id) ?? [];
+      while (hand.length < 5) {
+        const rank = this.randomRank();
+        hand.push(this.makeCard(rank, Math.floor(Math.random() * CARD_SUITS.length), `repair-${id}-${hand.length}`));
+      }
+      while (hand.length > 5) {
+        const hiddenId = this.unflippedNewCards.get(id);
+        const removableIndex = hand.findIndex((c) => c.id !== hiddenId);
+        hand.splice(removableIndex >= 0 ? removableIndex : hand.length - 1, 1);
+      }
+      this.hands.set(id, hand);
+      const currentNew = this.lastReceived.get(id);
+      if (!currentNew || !hand.some((c) => c.id === currentNew)) {
+        const newest = hand[hand.length - 1];
+        if (newest) {
+          this.lastReceived.set(id, newest.id);
+          if (!this.unflippedNewCards.has(id)) this.unflippedNewCards.set(id, newest.id);
+        }
+      }
+    }
+  }
+
   private sendHand(playerId: string) {
     const client = this.clients.find((c) => c.sessionId === playerId);
     if (!client) return;
@@ -705,6 +727,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     const spectatorView = !!p && this.state.phase === "playing" && (p.spectator || p.eliminated);
     const handOwnerId = spectatorView ? (dealer?.id ?? this.activeOrder[0] ?? playerId) : playerId;
     const owner = this.players.get(handOwnerId);
+    if (this.activeOrder.includes(handOwnerId)) this.normalizeActiveHands([handOwnerId]);
     const hiddenNewCardId = this.unflippedNewCards.get(handOwnerId) ?? "";
     const rawCards = this.hands.get(handOwnerId) ?? [];
     const visibleCards = rawCards.map((card) => {
