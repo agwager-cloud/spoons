@@ -185,10 +185,7 @@ export class GameScene extends Phaser.Scene {
       this.countdownNumber?.setText(String(Math.max(0, Math.ceil(countdownMs / 1000))));
       return;
     }
-    const scrambleActive = Boolean(Net.lastRoomInfo?.scrambleActive ?? state.scrambleActive);
-    const remaining = this.getPulseSecondsRemainingPrecise();
-    this.pulseText.setText(scrambleActive ? `Keep passing — next pass in ${remaining.toFixed(1)}s` : `Next pass in ${remaining.toFixed(1)}s`);
-    this.updateVisibleCardTimer();
+    this.pulseText.setText("Flip or swap quickly — cards auto-pass.");
   }
 
   private syncCardTimerFromHand(payload: any, incomingNewCardId: string) {
@@ -329,9 +326,7 @@ export class GameScene extends Phaser.Scene {
               ? "You have a spoon. Keep playing your hand while the round continues."
               : scrambleActive
               ? "A spoon has been taken. Click one of the remaining spoons before they run out."
-              : this.newCardFaceDown
-              ? "Tap FLIP on the new card, then choose one of your original 4 cards to pass left."
-              : "Choose one of your original 4 cards to keep the new card, or let the new card pass on.";
+              : "Flip or swap quickly — cards auto-pass.";
     this.objects.push(this.add.text(640, 104, status, {
       fontFamily: "Arial",
       fontSize: "19px",
@@ -530,13 +525,7 @@ export class GameScene extends Phaser.Scene {
         const badge = this.add.rectangle(x, y - 83, 82, 26, badgeColour, 1).setStrokeStyle(2, 0xffffff, 0.95);
         const badgeText = this.add.text(x, y - 83, faceDown ? "FLIP" : "NEW", { fontFamily: "Arial", fontSize: "15px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
         this.objects.push(badge, badgeText);
-        const timerShouldShow = true;
-        if (timerShouldShow) {
-          const seconds = this.getPulseSecondsRemaining();
-          const timerBubble = this.add.rectangle(x + 58, y - 83, 42, 26, 0x102a43, 0.92).setStrokeStyle(2, 0xffffff, 0.8);
-          this.cardTimerText = this.add.text(x + 58, y - 83, `${seconds}s`, { fontFamily: "Arial", fontSize: "14px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
-          this.objects.push(timerBubble, this.cardTimerText);
-        }
+        // Visible per-card countdown removed. The server still auto-passes cards after the hidden delay.
       }
       if (selected) {
         const passBadge = this.add.rectangle(x, y + 83, 96, 26, 0xf97316, 1).setStrokeStyle(2, 0xffffff, 0.95);
@@ -547,11 +536,7 @@ export class GameScene extends Phaser.Scene {
 
     const instruction = readOnly
       ? "Spectators can watch the dealer hand while the remaining players continue."
-      : this.newCardFaceDown
-        ? "Tap FLIP on the face-down new card first. If you do nothing, the new card passes on and your hand stays unchanged."
-        : this.selectedCardId
-          ? "Selected original card will pass left. The new card will replace it when the timer ends."
-          : "New card is revealed. Choose one of your original 4 cards to keep it, or let the new card pass on.";
+      : "Flip or swap quickly — cards auto-pass.";
     this.objects.push(this.add.text(640, 692, instruction, {
       fontFamily: "Arial",
       fontSize: "16px",
