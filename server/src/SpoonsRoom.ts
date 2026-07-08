@@ -33,6 +33,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
   private botFlipTimers = new Map<string, NodeJS.Timeout>();
   private botCounter = 1;
   private pulsesThisRound = 0;
+  private turnSeq = 0;
   private roundAssistUsed = false;
   private lateBotAssistUsed = false;
   private roomHostId = "";
@@ -234,6 +235,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     }
     this.seedOpeningHands(current);
     this.markCurrentNewCardsFaceDown();
+    this.turnSeq += 1;
 
     this.recount();
     this.sendAllRoomInfo();
@@ -392,6 +394,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
 
     if (!this.state.scrambleActive) this.maybeAssistSlowRound(order);
 
+    this.turnSeq += 1;
     this.sendAllHands();
     this.scheduleBotFlips();
 
@@ -718,6 +721,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
       pulseMs: PULSE_MS,
       nextPulseAt: this.state.nextPulseAt,
       nextPulseMs: this.state.nextPulseAt > 0 ? Math.max(0, this.state.nextPulseAt - Date.now()) : 0,
+      turnSeq: this.turnSeq,
       spectatorView,
       handOwnerName: owner?.name ?? "Dealer"
     });
@@ -838,7 +842,8 @@ export class SpoonsRoom extends Room<SpoonsState> {
       roundStartsAt: this.state.roundStartsAt,
       roundCountdownMs: this.state.roundStartsAt > 0 ? Math.max(0, this.state.roundStartsAt - Date.now()) : 0,
       revision: this.state.revision,
-      pulseMs: PULSE_MS
+      pulseMs: PULSE_MS,
+      turnSeq: this.turnSeq
     };
   }
 

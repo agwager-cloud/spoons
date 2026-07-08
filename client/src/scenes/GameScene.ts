@@ -84,6 +84,9 @@ export class GameScene extends Phaser.Scene {
   private localPulseDeadline = 0;
   private localPulseKey = "";
   private localPulseDuration = 5000;
+  private turnSeq = -1;
+  private turnTimerDeadlineMs = 0;
+  private turnTimerDurationMs = 5000;
   private lastHandNewCardId = "";
   private spectatorHand = false;
   private handOwnerName = "Dealer";
@@ -178,55 +181,58 @@ export class GameScene extends Phaser.Scene {
     const scrambleActive = Boolean(Net.lastRoomInfo?.scrambleActive ?? state.scrambleActive);
     if (scrambleActive) {
       this.pulseText.setText("SPOON SCRAMBLE!");
-      if (this.cardTimerText?.active) this.cardTimerText.setText("");
+      this.updateVisibleCardTimer();
       return;
     }
     const remaining = this.getPulseSecondsRemainingPrecise();
     this.pulseText.setText(`Next pass in ${remaining.toFixed(1)}s`);
-    if (this.cardTimerText?.active) {
-      this.cardTimerText.setText(`${this.getPulseSecondsRemaining()}s`);
-    }
+    this.updateVisibleCardTimer();
   }
 
   private syncCardTimerFromHand(payload: any, incomingNewCardId: string) {
-    if (!incomingNewCardId || this.spectatorHand) return;
+    if (!incomingNewCardId) return;
+
     const duration = Number(payload?.pulseMs ?? Net.lastRoomInfo?.pulseMs ?? 5000) || 5000;
-    this.localPulseDuration = duration;
+    const incomingSeqRaw = payload?.turnSeq ?? Net.lastRoomInfo?.turnSeq ?? 0;
+    const incomingSeq = Number.isFinite(Number(incomingSeqRaw)) ? Number(incomingSeqRaw) : this.turnSeq;
+    const nextPulseMsRaw = Number(payload?.nextPulseMs ?? Net.lastRoomInfo?.nextPulseMs ?? 0);
+    const remainingMs = Number.isFinite(nextPulseMsRaw) && nextPulseMsRaw > 0
+      ? Math.min(duration, nextPulseMsRaw)
+      : duration;
 
-    const nextPulseMs = Number(payload?.nextPulseMs ?? Net.lastRoomInfo?.nextPulseMs ?? 0);
-    const deadline = nextPulseMs > 0 ? Date.now() + nextPulseMs : Date.now() + duration;
+    const cardChanged = incomingNewCardId !== this.lastHandNewCardId;
+    const turnChanged = incomingSeq !== this.turnSeq;
+    const timerMissing = this.turnTimerDeadlineMs <= 0;
 
-    const isNewCard = incomingNewCardId !== this.lastHandNewCardId;
-    const isExpired = this.localPulseDeadline <= Date.now();
-    const isClearlyDifferent = Math.abs(deadline - this.localPulseDeadline) > 700;
-
-    if (isNewCard || isExpired || isClearlyDifferent) {
-      this.localPulseDeadline = deadline;
+    // Critical timer rule: only reset the visible 5 second card timer when a
+    // genuinely new pass window begins. Do not reset it when the server re-sends
+    // the same hand because a bot flipped, a spoon was clicked, or roomInfo updated.
+    if (cardChanged || turnChanged || timerMissing) {
+      this.turnSeq = incomingSeq;
+      this.localPulseKey = `${incomingSeq}:${incomingNewCardId}`;
+      this.localPulseDuration = duration;
+      this.turnTimerDurationMs = duration;
+      this.turnTimerDeadlineMs = performance.now() + remainingMs;
+      this.localPulseDeadline = Date.now() + remainingMs;
       this.lastHandNewCardId = incomingNewCardId;
-      this.localPulseKey = String(payload?.nextPulseAt ?? incomingNewCardId);
     }
   }
 
   private anchorPulseFromRoomInfo(info: any) {
-    const scrambleActive = Boolean(info?.scrambleActive);
     const roundStartsAt = Number(info?.roundStartsAt ?? 0);
-    const nextPulseAt = Number(info?.nextPulseAt ?? 0);
+    if (roundStartsAt > 0 || !this.newCardId) return;
+
+    const incomingSeqRaw = info?.turnSeq ?? this.turnSeq;
+    const incomingSeq = Number.isFinite(Number(incomingSeqRaw)) ? Number(incomingSeqRaw) : this.turnSeq;
     const nextPulseMs = Number(info?.nextPulseMs ?? 0);
-
-    if (scrambleActive || roundStartsAt > 0) {
-      this.localPulseDeadline = 0;
-      this.localPulseKey = "";
-      return;
-    }
-
-    if (!this.newCardId || this.spectatorHand || nextPulseAt <= 0 || nextPulseMs <= 0) return;
-
-    const key = String(nextPulseAt);
-    const deadline = Date.now() + nextPulseMs;
-    if (key !== this.localPulseKey || Math.abs(deadline - this.localPulseDeadline) > 700) {
-      this.localPulseKey = key;
-      this.localPulseDuration = Number(info?.pulseMs ?? 5000) || 5000;
-      this.localPulseDeadline = deadline;
+    if (incomingSeq !== this.turnSeq && nextPulseMs > 0) {
+      const duration = Number(info?.pulseMs ?? 5000) || 5000;
+      this.turnSeq = incomingSeq;
+      this.localPulseKey = `${incomingSeq}:${this.newCardId}`;
+      this.localPulseDuration = duration;
+      this.turnTimerDurationMs = duration;
+      this.turnTimerDeadlineMs = performance.now() + Math.min(duration, nextPulseMs);
+      this.localPulseDeadline = Date.now() + Math.min(duration, nextPulseMs);
     }
   }
 
@@ -519,11 +525,11 @@ export class GameScene extends Phaser.Scene {
         const badge = this.add.rectangle(x, y - 83, 82, 26, badgeColour, 1).setStrokeStyle(2, 0xffffff, 0.95);
         const badgeText = this.add.text(x, y - 83, faceDown ? "FLIP" : "NEW", { fontFamily: "Arial", fontSize: "15px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
         this.objects.push(badge, badgeText);
-        const timerShouldShow = !readOnly && !Boolean(Net.lastRoomInfo?.scrambleActive ?? Net.room?.state?.scrambleActive);
+        const timerShouldShow = true;
         if (timerShouldShow) {
           const seconds = this.getPulseSecondsRemaining();
           const timerBubble = this.add.rectangle(x + 58, y - 83, 42, 26, 0x102a43, 0.92).setStrokeStyle(2, 0xffffff, 0.8);
-          this.cardTimerText = this.add.text(x + 58, y - 83, `${Math.max(1, seconds)}s`, { fontFamily: "Arial", fontSize: "14px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
+          this.cardTimerText = this.add.text(x + 58, y - 83, `${seconds}s`, { fontFamily: "Arial", fontSize: "14px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
           this.objects.push(timerBubble, this.cardTimerText);
         }
       }
@@ -551,33 +557,36 @@ export class GameScene extends Phaser.Scene {
     }).setOrigin(0.5));
   }
 
-  private getPulseSecondsRemainingPrecise() {
-    if (this.localPulseDeadline > 0) {
-      return Math.max(0, Math.ceil((this.localPulseDeadline - Date.now()) / 100) / 10);
-    }
+  private updateVisibleCardTimer() {
+    if (this.cardTimerText?.active) this.cardTimerText.setText(`${this.getPulseSecondsRemaining()}s`);
+  }
+
+  private getPulseMsRemaining() {
+    if (this.turnTimerDeadlineMs > 0) return Math.max(0, this.turnTimerDeadlineMs - performance.now());
 
     const info = Net.lastRoomInfo ?? {};
     const receivedAt = Number(info._receivedAt ?? 0);
     const fromInfoMs = Number(info.nextPulseMs);
     if (Number.isFinite(fromInfoMs) && fromInfoMs > 0 && receivedAt > 0) {
-      return Math.max(0, Math.ceil((fromInfoMs - (Date.now() - receivedAt)) / 100) / 10);
+      return Math.max(0, fromInfoMs - (Date.now() - receivedAt));
     }
 
     const infoAt = Number(info.nextPulseAt ?? 0);
-    if (Number.isFinite(infoAt) && infoAt > 0) {
-      return Math.max(0, Math.ceil((infoAt - Date.now()) / 100) / 10);
-    }
+    if (Number.isFinite(infoAt) && infoAt > 0) return Math.max(0, infoAt - Date.now());
 
     const state: any = Net.room?.state;
     const stateAt = Number(state?.nextPulseAt ?? 0);
-    return Math.max(0, Math.ceil((stateAt - Date.now()) / 100) / 10);
+    if (Number.isFinite(stateAt) && stateAt > 0) return Math.max(0, stateAt - Date.now());
+
+    return this.turnTimerDurationMs;
+  }
+
+  private getPulseSecondsRemainingPrecise() {
+    return Math.max(0, Math.ceil(this.getPulseMsRemaining() / 100) / 10);
   }
 
   private getPulseSecondsRemaining() {
-    if (this.localPulseDeadline > 0) {
-      return Math.max(1, Math.ceil((this.localPulseDeadline - Date.now()) / 1000));
-    }
-    return Math.max(1, Math.ceil(this.getPulseSecondsRemainingPrecise()));
+    return Math.max(0, Math.ceil(this.getPulseMsRemaining() / 1000));
   }
 
   private drawRoundInfo(roster: PlayerLike[], me?: PlayerLike) {
