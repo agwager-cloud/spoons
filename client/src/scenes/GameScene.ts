@@ -3,7 +3,7 @@ import { Net } from "../net/Net";
 import { addPanel, addSoundButton } from "../ui/panel";
 import { toggleSound, isSoundOn, preloadBackgroundMusic, syncBackgroundMusic } from "../utils/sound";
 
-interface CardView { id: string; rank: string; suit: string; short: string; }
+interface CardView { id: string; rank: string; suit: string; short: string; faceDown?: boolean; }
 interface PlayerLike {
   id: string;
   name: string;
@@ -79,6 +79,8 @@ export class GameScene extends Phaser.Scene {
   private hand: CardView[] = [];
   private newCardId = "";
   private selectedCardId = "";
+  private newCardFaceDown = false;
+  private cardTimerText?: Phaser.GameObjects.Text;
   private spectatorHand = false;
   private handOwnerName = "Dealer";
   private objects: Phaser.GameObjects.GameObject[] = [];
@@ -96,6 +98,7 @@ export class GameScene extends Phaser.Scene {
 
   preload() {
     if (!this.textures.exists("gameBg")) this.load.image("gameBg", "assets/backgrounds/bg.jpg");
+    if (!this.textures.exists("spoonSprite")) this.load.image("spoonSprite", "assets/sprites/spoonSprite.png");
     preloadBackgroundMusic(this);
   }
 
@@ -132,6 +135,7 @@ export class GameScene extends Phaser.Scene {
     this.offHand = Net.on("hand", (payload) => {
       this.hand = payload.cards ?? [];
       this.newCardId = String(payload.newCardId ?? "");
+      this.newCardFaceDown = !!payload.newCardFaceDown || this.hand.some((card) => card.id === this.newCardId && card.faceDown);
       this.selectedCardId = String(payload.selectedCardId ?? this.selectedCardId ?? "");
       this.spectatorHand = !!payload.spectatorView;
       this.handOwnerName = String(payload.handOwnerName ?? "Dealer");
@@ -163,6 +167,9 @@ export class GameScene extends Phaser.Scene {
     }
     const remaining = Math.max(0, Math.ceil((state.nextPulseAt - Date.now()) / 100) / 10);
     this.pulseText.setText(state.scrambleActive ? `SPOON SCRAMBLE! Passes continue in ${remaining.toFixed(1)}s` : `Next pass in ${remaining.toFixed(1)}s`);
+    if (this.cardTimerText?.active) {
+      this.cardTimerText.setText(`${Math.max(0, Math.ceil(remaining))}s`);
+    }
   }
 
   private getCountdownMs(state: any): number {
@@ -215,6 +222,7 @@ export class GameScene extends Phaser.Scene {
     this.objects.forEach((o) => o.destroy());
     this.objects = [];
     this.countdownNumber = undefined;
+    this.cardTimerText = undefined;
     this.drawRoomCodePill(state);
     const roster = players();
     const me = roster.find((p) => p.id === Net.playerId);
@@ -235,7 +243,7 @@ export class GameScene extends Phaser.Scene {
     const spoonsAvailable = Number(Net.lastRoomInfo?.spoonsAvailable ?? state.spoonsAvailable ?? 0);
     const takenSpoons = numberArrayFromSchema(Net.lastRoomInfo?.takenSpoonsJson ?? Net.lastRoomInfo?.takenSpoons ?? state.takenSpoonsJson);
     const spoonCount = Math.max(0, spoonsAvailable - takenSpoons.length);
-    const canGrabFirst = this.hasFourOfKind() && !scrambleActive && !countdownActive && !me?.spectator && !me?.eliminated && !hasSpoon && spoonCount > 0;
+    const canGrabFirst = this.hasFourOfKind() && !this.newCardFaceDown && !scrambleActive && !countdownActive && !me?.spectator && !me?.eliminated && !hasSpoon && spoonCount > 0;
     const canGrabScramble = scrambleActive && !countdownActive && !me?.spectator && !me?.eliminated && !hasSpoon && spoonCount > 0;
     this.drawSpoons(spoonCount, scrambleActive, spoonsAvailable, takenSpoons, canGrabFirst || canGrabScramble, hasSpoon, canGrabFirst);
 
@@ -250,19 +258,21 @@ export class GameScene extends Phaser.Scene {
             ? "You have a spoon. Keep watching until one player misses out."
             : scrambleActive
               ? "A spoon has been taken. Click one of the remaining spoons before they run out."
-              : "Pick up the new card first. Then tap one of your 5 cards to pass left.";
-    this.objects.push(this.add.text(640, 120, status, {
+              : this.newCardFaceDown
+              ? "Tap FLIP on the new card, then choose one of your 5 cards to pass left."
+              : "Choose one card to pass left before the timer reaches zero.";
+    this.objects.push(this.add.text(640, 118, status, {
       fontFamily: "Arial",
       fontSize: "19px",
       color: "#ffffff",
       align: "center",
-      wordWrap: { width: 850 },
+      wordWrap: { width: 860 },
       shadow: { offsetX: 0, offsetY: 3, color: "#00162e", blur: 5, fill: true }
     }).setOrigin(0.5));
 
     const activeCount = Net.lastRoomInfo?.activeCount ?? Net.room?.state.activeCount ?? 0;
     const eliminatedCount = Net.lastRoomInfo?.eliminatedCount ?? Net.room?.state.eliminatedCount ?? 0;
-    this.objects.push(this.add.text(640, 344, `Active: ${activeCount}    Eliminated: ${eliminatedCount}`, {
+    this.objects.push(this.add.text(640, 336, `Active: ${activeCount}    Eliminated: ${eliminatedCount}`, {
       fontFamily: "Arial",
       fontSize: "23px",
       color: "#ffffff",
@@ -275,7 +285,9 @@ export class GameScene extends Phaser.Scene {
       ? `${this.handOwnerName.toUpperCase()}'S HAND — spectator view`
       : hasSpoon
         ? "YOUR HAND — you already have a spoon"
-        : "YOUR HAND — tap one card to pass left";
+        : this.newCardFaceDown
+          ? "YOUR HAND — tap FLIP, then choose a card"
+          : "YOUR HAND — tap one card to pass left";
     this.drawHand(readOnly, handTitle);
 
     this.drawRoundInfo(roster, me);
@@ -302,27 +314,29 @@ export class GameScene extends Phaser.Scene {
   private drawSpoons(count: number, scramble: boolean, availableFromInfo: number | undefined, takenSlots: number[], canClick: boolean, hasSpoon: boolean, firstSpoonReady: boolean) {
     const totalSlots = Math.max(1, availableFromInfo ?? Net.room?.state.spoonsAvailable ?? 1);
     const taken = new Set(takenSlots);
-    const cols = Math.min(13, totalSlots);
-    const spacingX = 40;
-    const spacingY = 40;
+    const cols = totalSlots > 30 ? 20 : totalSlots > 20 ? 15 : totalSlots > 10 ? 10 : totalSlots;
+    const spacingX = totalSlots > 30 ? 31 : totalSlots > 20 ? 36 : totalSlots > 10 ? 42 : 50;
+    const spacingY = totalSlots > 30 ? 38 : 42;
     const rows = Math.ceil(totalSlots / cols);
-    const centerY = rows >= 3 ? 220 : 218;
+    const spoonW = totalSlots > 30 ? 18 : totalSlots > 20 ? 20 : 24;
+    const spoonH = totalSlots > 30 ? 38 : totalSlots > 20 ? 42 : 50;
+    const labelY = 158;
+    const padY = rows >= 3 ? 236 : 222;
     const startX = 640 - ((cols - 1) * spacingX) / 2;
-    const startY = centerY - ((rows - 1) * spacingY) / 2;
+    const startY = padY - ((rows - 1) * spacingY) / 2;
 
-    this.objects.push(this.add.text(640, 166, `${count} spoon${count === 1 ? "" : "s"} left`, {
+    this.objects.push(this.add.text(640, labelY, `${count} spoon${count === 1 ? "" : "s"} left`, {
       fontFamily: "Arial",
-      fontSize: "30px",
+      fontSize: totalSlots > 30 ? "25px" : "29px",
       color: "#ffffff",
       fontStyle: "bold",
       shadow: { offsetX: 0, offsetY: 3, color: "#00162e", blur: 5, fill: true }
     }).setOrigin(0.5));
 
-    const padW = Math.min(760, Math.max(280, cols * spacingX + 48));
-    const padH = Math.max(68, rows * spacingY + 32);
-    const padY = startY + ((rows - 1) * spacingY) / 2;
-    const pad = this.add.rectangle(640, padY, padW, padH, canClick ? 0x173b2e : 0x00162e, canClick ? 0.28 : 0.18)
-      .setStrokeStyle(canClick ? 4 : 2, canClick ? 0xfacc15 : 0xffffff, canClick ? 0.95 : 0.16);
+    const padW = Math.min(880, Math.max(300, (cols - 1) * spacingX + spoonW + 58));
+    const padH = Math.max(74, (rows - 1) * spacingY + spoonH + 36);
+    const pad = this.add.rectangle(640, padY, padW, padH, canClick ? 0x173b2e : 0x00162e, canClick ? 0.32 : 0.2)
+      .setStrokeStyle(canClick ? 4 : 2, canClick ? 0xdbeafe : 0xffffff, canClick ? 0.95 : 0.18);
     this.objects.push(pad);
 
     for (let i = 0; i < totalSlots; i++) {
@@ -332,39 +346,46 @@ export class GameScene extends Phaser.Scene {
       const y = startY + row * spacingY;
       const available = !taken.has(i);
       const clickable = canClick && available;
-      const spoon = this.add.ellipse(x, y, clickable ? 20 : 16, clickable ? 46 : 39, available ? 0xf2c94c : 0x56616f, available ? 1 : 0.28)
-        .setStrokeStyle(clickable ? 5 : scramble && available ? 3 : 2, clickable ? 0xfffbeb : 0xffffff, clickable ? 1 : 0.65)
-        .setRotation(-0.45);
-      if (clickable) {
-        spoon.setInteractive({ useHandCursor: true });
-        spoon.on("pointerdown", () => Net.send("grabSpoon", { spoonIndex: i }));
+
+      if (available && this.textures.exists("spoonSprite")) {
+        const spoon = this.add.image(x, y, "spoonSprite").setDisplaySize(spoonW, spoonH).setAlpha(clickable || !scramble ? 1 : 0.9);
+        if (clickable) {
+          spoon.setInteractive({ useHandCursor: true, pixelPerfect: true, alphaTolerance: 1 });
+          spoon.on("pointerdown", () => Net.send("grabSpoon", { spoonIndex: i }));
+          this.tweens.add({ targets: spoon, scaleX: spoon.scaleX * 1.08, scaleY: spoon.scaleY * 1.08, yoyo: true, repeat: -1, duration: 420 });
+        }
+        this.objects.push(spoon);
+      } else {
+        const outline = this.add.ellipse(x, y, spoonW * 0.85, spoonH * 0.88, 0xffffff, 0.02)
+          .setStrokeStyle(2, 0xdbeafe, available ? 0.65 : 0.42)
+          .setRotation(-0.45);
+        this.objects.push(outline);
       }
-      this.objects.push(spoon);
     }
 
     const hint = canClick
       ? firstSpoonReady
-        ? "FOUR OF A KIND — CLICK A GOLD SPOON!"
-        : "CLICK A GOLD SPOON TO STAY IN!"
+        ? "FOUR OF A KIND — CLICK A SILVER SPOON!"
+        : "CLICK A SILVER SPOON TO STAY IN!"
       : hasSpoon && scramble
         ? "Spoon secured — wait for the round to finish."
         : scramble
-          ? "Only gold spoons can be grabbed."
-          : "Spoons unlock when someone gets four of a kind.";
-    this.objects.push(this.add.text(640, padY + padH / 2 + 24, hint, {
+          ? "Only silver spoons can be grabbed."
+          : "Spoons unlock after someone flips into four of a kind.";
+    this.objects.push(this.add.text(640, padY + padH / 2 + 20, hint, {
       fontFamily: "Arial",
-      fontSize: canClick ? "18px" : "15px",
-      color: canClick ? "#facc15" : "#dbeafe",
+      fontSize: canClick ? "17px" : "14px",
+      color: canClick ? "#e0f2fe" : "#dbeafe",
       fontStyle: "bold",
       shadow: { offsetX: 0, offsetY: 2, color: "#00162e", blur: 4, fill: true }
     }).setOrigin(0.5));
   }
 
   private drawHand(readOnly: boolean, title: string) {
-    const panelShadow = this.add.rectangle(640, 590, 770, 176, 0x000000, 0.22);
-    const panel = addPanel(this, 640, 582, 770, 176, 0xffffff, 0.94);
-    const header = this.add.rectangle(640, 500, 770, 36, readOnly ? 0x41556e : 0x1d4ed8, 0.92);
-    const headerText = this.add.text(640, 500, title, {
+    const panelShadow = this.add.rectangle(640, 594, 770, 172, 0x000000, 0.22);
+    const panel = addPanel(this, 640, 586, 770, 172, 0xffffff, 0.94);
+    const header = this.add.rectangle(640, 505, 770, 34, readOnly ? 0x41556e : this.newCardFaceDown ? 0xf59e0b : 0x1d4ed8, 0.95);
+    const headerText = this.add.text(640, 505, title, {
       fontFamily: "Arial",
       fontSize: "19px",
       color: "#ffffff",
@@ -384,31 +405,62 @@ export class GameScene extends Phaser.Scene {
 
     const spacing = this.hand.length >= 5 ? 124 : 140;
     const startX = 640 - ((this.hand.length - 1) * spacing) / 2;
+    const pulseSeconds = this.getPulseSecondsRemaining();
+
     this.hand.forEach((card, index) => {
       const x = startX + index * spacing;
-      const y = 588;
+      const y = 593;
       const selected = !readOnly && card.id === this.selectedCardId;
       const isNew = card.id === this.newCardId;
-      const fill = isNew ? 0xfffbeb : 0xffffff;
-      const stroke = selected ? 0xf97316 : isNew ? 0xf2c94c : 0x102a43;
-      const strokeWidth = selected ? 7 : isNew ? 5 : 3;
+      const faceDown = !!card.faceDown;
+      const mustFlipFirst = !readOnly && this.newCardFaceDown;
+      const canFlip = mustFlipFirst && isNew && faceDown;
+      const canSelect = !readOnly && !this.newCardFaceDown && !faceDown;
+      const fill = faceDown ? 0x1e3a8a : isNew ? 0xfffbeb : 0xffffff;
+      const stroke = selected ? 0xf97316 : faceDown ? 0xf59e0b : isNew ? 0xf2c94c : 0x102a43;
+      const strokeWidth = selected ? 7 : isNew || faceDown ? 5 : 3;
       const rect = this.add.rectangle(x, y, 100, 126, fill, 1).setStrokeStyle(strokeWidth, stroke, 0.98);
-      if (!readOnly) rect.setInteractive({ useHandCursor: true });
-      const rankColor = card.suit === "♥" || card.suit === "♦" ? "#b42318" : "#102a43";
-      const txt = this.add.text(x, y + 2, card.short, { fontFamily: "Arial", fontSize: "32px", color: rankColor, fontStyle: "bold" }).setOrigin(0.5);
-      if (!readOnly) {
-        rect.on("pointerdown", () => {
-          this.selectedCardId = card.id;
-          Net.send("selectDiscard", { cardId: card.id });
-          this.render();
-        });
+
+      if (faceDown) {
+        const back1 = this.add.rectangle(x, y, 78, 104, 0x2563eb, 0.95).setStrokeStyle(2, 0xdbeafe, 0.9);
+        const back2 = this.add.text(x, y, "♠\n♥\n♦\n♣", {
+          fontFamily: "Arial",
+          fontSize: "18px",
+          color: "#dbeafe",
+          align: "center",
+          fontStyle: "bold"
+        }).setOrigin(0.5);
+        if (canFlip) {
+          rect.setInteractive({ useHandCursor: true });
+          back1.setInteractive({ useHandCursor: true });
+          back2.setInteractive({ useHandCursor: true });
+          const flip = () => Net.send("flipNewCard");
+          rect.on("pointerdown", flip);
+          back1.on("pointerdown", flip);
+          back2.on("pointerdown", flip);
+        }
+        this.objects.push(rect, back1, back2);
+      } else {
+        if (canSelect) rect.setInteractive({ useHandCursor: true });
+        const rankColor = card.suit === "♥" || card.suit === "♦" ? "#b42318" : "#102a43";
+        const txt = this.add.text(x, y + 2, card.short, { fontFamily: "Arial", fontSize: "32px", color: rankColor, fontStyle: "bold" }).setOrigin(0.5);
+        if (canSelect) {
+          rect.on("pointerdown", () => {
+            this.selectedCardId = card.id;
+            Net.send("selectDiscard", { cardId: card.id });
+            this.render();
+          });
+        }
+        this.objects.push(rect, txt);
       }
-      this.objects.push(rect, txt);
 
       if (isNew) {
-        const badge = this.add.rectangle(x, y - 83, 82, 26, 0xf59e0b, 1).setStrokeStyle(2, 0xffffff, 0.95);
-        const badgeText = this.add.text(x, y - 83, "NEW", { fontFamily: "Arial", fontSize: "15px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
-        this.objects.push(badge, badgeText);
+        const badgeColour = faceDown ? 0xf97316 : 0xf59e0b;
+        const badge = this.add.rectangle(x, y - 83, 82, 26, badgeColour, 1).setStrokeStyle(2, 0xffffff, 0.95);
+        const badgeText = this.add.text(x, y - 83, faceDown ? "FLIP" : "NEW", { fontFamily: "Arial", fontSize: "15px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
+        const timerBubble = this.add.rectangle(x + 58, y - 83, 42, 26, 0x102a43, 0.92).setStrokeStyle(2, 0xffffff, 0.8);
+        this.cardTimerText = this.add.text(x + 58, y - 83, `${pulseSeconds}s`, { fontFamily: "Arial", fontSize: "14px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
+        this.objects.push(badge, badgeText, timerBubble, this.cardTimerText);
       }
       if (selected) {
         const passBadge = this.add.rectangle(x, y + 83, 96, 26, 0xf97316, 1).setStrokeStyle(2, 0xffffff, 0.95);
@@ -419,17 +471,25 @@ export class GameScene extends Phaser.Scene {
 
     const instruction = readOnly
       ? "Spectators can watch the dealer hand while the remaining players continue."
-      : this.selectedCardId
-        ? "Selected card will pass left on the next pulse. You can change your mind before the timer ends."
-        : "You have 5 cards after picking up. Choose the card you want to discard left.";
-    this.objects.push(this.add.text(640, 690, instruction, {
+      : this.newCardFaceDown
+        ? "Tap FLIP on the face-down new card first. The game only recognises four of a kind after the card is flipped."
+        : this.selectedCardId
+          ? "Selected card will pass left on the next pulse. You can change your mind before the timer ends."
+          : "New card is revealed. Choose one of your 5 cards to discard left.";
+    this.objects.push(this.add.text(640, 692, instruction, {
       fontFamily: "Arial",
       fontSize: "16px",
       color: "#ffffff",
       align: "center",
-      wordWrap: { width: 820 },
+      wordWrap: { width: 860 },
       shadow: { offsetX: 0, offsetY: 2, color: "#00162e", blur: 4, fill: true }
     }).setOrigin(0.5));
+  }
+
+  private getPulseSecondsRemaining() {
+    const state: any = Net.room?.state;
+    const value = Number(state?.nextPulseAt ?? 0) - Date.now();
+    return Math.max(0, Math.ceil(value / 1000));
   }
 
   private drawRoundInfo(roster: PlayerLike[], me?: PlayerLike) {
@@ -492,7 +552,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   private hasFourOfKind() {
-    if (this.hand.length < 4 || this.spectatorHand) return false;
+    if (this.hand.length < 4 || this.spectatorHand || this.newCardFaceDown) return false;
     const ranks = new Map<string, number>();
     this.hand.forEach((c) => ranks.set(c.rank, (ranks.get(c.rank) ?? 0) + 1));
     return Array.from(ranks.values()).some((count) => count >= 4);
