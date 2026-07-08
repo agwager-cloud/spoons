@@ -147,7 +147,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
   }
 
   onDispose() {
-    if (this.pulseTimer) clearInterval(this.pulseTimer);
+    if (this.pulseTimer) clearTimeout(this.pulseTimer);
     if (this.roundStartTimer) clearTimeout(this.roundStartTimer);
     if (this.roundCountdownTimer) clearInterval(this.roundCountdownTimer);
     this.clearBotScrambleTimers();
@@ -278,7 +278,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
   }
 
   private stopGameTimers() {
-    if (this.pulseTimer) clearInterval(this.pulseTimer);
+    if (this.pulseTimer) clearTimeout(this.pulseTimer);
     this.pulseTimer = undefined;
     if (this.roundStartTimer) clearTimeout(this.roundStartTimer);
     this.roundStartTimer = undefined;
@@ -289,19 +289,42 @@ export class SpoonsRoom extends Room<SpoonsState> {
   }
 
   private startPulseLoop() {
-    if (this.pulseTimer) clearInterval(this.pulseTimer);
-    this.state.nextPulseAt = Date.now() + PULSE_MS;
-    this.syncState();
-    // Send an explicit roomInfo packet as soon as the timer starts so clients do
-    // not render the new-card timer as 0s while waiting for schema sync.
-    this.sendAllRoomInfo();
-    this.pulseTimer = setInterval(() => {
-      if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
-      this.pulse();
-      if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
-      this.state.nextPulseAt = Date.now() + PULSE_MS;
+    if (this.pulseTimer) clearTimeout(this.pulseTimer);
+    this.pulseTimer = undefined;
+    this.scheduleNextPulse();
+  }
+
+  private scheduleNextPulse() {
+    if (this.state.phase !== "playing" || this.state.roundStartsAt > 0 || this.state.scrambleActive) {
+      this.state.nextPulseAt = 0;
       this.syncState();
       this.sendAllRoomInfo();
+      return;
+    }
+
+    if (this.pulseTimer) clearTimeout(this.pulseTimer);
+    this.state.nextPulseAt = Date.now() + PULSE_MS;
+    this.syncState();
+    // Send an explicit roomInfo packet as soon as the timer starts so clients can
+    // run a smooth local 5 second card countdown between server pulses.
+    this.sendAllRoomInfo();
+
+    this.pulseTimer = setTimeout(() => {
+      this.pulseTimer = undefined;
+      if (this.state.phase !== "playing" || this.state.roundStartsAt > 0) return;
+      if (this.state.scrambleActive) {
+        this.state.nextPulseAt = 0;
+        this.syncState();
+        this.sendAllRoomInfo();
+        return;
+      }
+      this.pulse();
+      if (this.state.phase === "playing" && this.state.roundStartsAt === 0 && !this.state.scrambleActive) this.scheduleNextPulse();
+      else {
+        this.state.nextPulseAt = 0;
+        this.syncState();
+        this.sendAllRoomInfo();
+      }
     }, PULSE_MS);
   }
 
@@ -473,13 +496,20 @@ export class SpoonsRoom extends Room<SpoonsState> {
         return;
       }
       this.state.scrambleActive = true;
+      this.state.nextPulseAt = 0;
       this.state.firstSpoonId = playerId;
       this.state.dealerId = playerId;
       p.firstSpoon = true;
       p.score += 1;
+      // Once spoons are live, freeze card passing so players do not see their
+      // hands randomly change into four of a kind during the scramble.
+      if (this.pulseTimer) clearTimeout(this.pulseTimer);
+      this.pulseTimer = undefined;
+      this.selected.clear();
       // Clear any delayed first-spoon bot attempts before starting the slower scramble timers.
       this.clearBotScrambleTimers();
       this.broadcast("toast", { message: `${p.name} got four of a kind — spoons are live!` });
+      this.sendAllHands();
     }
 
     if (this.state.spoonsTaken >= this.state.spoonsAvailable || this.takenSpoonSlots.has(slot)) return;
@@ -910,22 +940,18 @@ export class SpoonsRoom extends Room<SpoonsState> {
       .map((id) => this.players.get(id))
       .filter((p): p is PlayerData => !!p && p.isBot && !p.eliminated && !p.spectator);
 
-    // First nudge: give a human a clear chance to notice four of a kind and click a spoon.
-    if (!this.roundAssistUsed && this.pulsesThisRound >= 7 && !order.some((id) => this.hasFourOfKindRevealed(id))) {
-      const target = activeHumans.length > 0
-        ? activeHumans[Math.floor(Math.random() * activeHumans.length)]
-        : activeBots[Math.floor(Math.random() * activeBots.length)];
-      if (target) {
-        this.giveFourOfKind(target.id);
-        this.roundAssistUsed = true;
-        if (!target.isBot) {
-          this.clients.find((c) => c.sessionId === target.id)?.send("toast", { message: "You have four of a kind. Click a spoon!" });
-        }
-      }
+    // First nudge for bot-heavy testing. Do not modify a human hand here: that
+    // felt like the game was randomly changing a player's cards when another
+    // player triggered the spoons. Humans should only reach four of a kind through
+    // the normal passing flow.
+    if (!this.roundAssistUsed && this.pulsesThisRound >= 7 && activeBots.length > 0 && !order.some((id) => this.hasFourOfKindRevealed(id))) {
+      const bot = activeBots[Math.floor(Math.random() * activeBots.length)];
+      this.giveFourOfKind(bot.id);
+      this.roundAssistUsed = true;
     }
 
-    // Safety nudge for bot-heavy testing: if a human gets the chance but does not click,
-    // a bot will eventually become a threat so the round never drags on forever.
+    // Safety nudge for bot-heavy testing: a bot will eventually become a threat
+    // so the round never drags on forever.
     if (!this.lateBotAssistUsed && this.pulsesThisRound >= 11 && activeBots.length > 0) {
       const bot = activeBots[Math.floor(Math.random() * activeBots.length)];
       this.giveFourOfKind(bot.id);

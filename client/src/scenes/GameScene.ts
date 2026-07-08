@@ -81,6 +81,10 @@ export class GameScene extends Phaser.Scene {
   private selectedCardId = "";
   private newCardFaceDown = false;
   private cardTimerText?: Phaser.GameObjects.Text;
+  private localPulseDeadline = 0;
+  private localPulseKey = "";
+  private localPulseDuration = 5000;
+  private lastHandNewCardId = "";
   private spectatorHand = false;
   private handOwnerName = "Dealer";
   private objects: Phaser.GameObjects.GameObject[] = [];
@@ -131,15 +135,25 @@ export class GameScene extends Phaser.Scene {
     }).setOrigin(0.5);
 
     this.offState = Net.on("state", () => this.render());
-    this.offRoomInfo = Net.on("roomInfo", () => this.render());
+    this.offRoomInfo = Net.on("roomInfo", (payload) => {
+      this.anchorPulseFromRoomInfo(payload);
+      this.render();
+    });
     this.offHand = Net.on("hand", (payload) => {
+      const incomingNewCardId = String(payload.newCardId ?? "");
       this.hand = payload.cards ?? [];
-      this.newCardId = String(payload.newCardId ?? "");
+      this.newCardId = incomingNewCardId;
       this.newCardFaceDown = !!payload.newCardFaceDown || this.hand.some((card) => card.id === this.newCardId && card.faceDown);
       this.selectedCardId = String(payload.selectedCardId ?? this.selectedCardId ?? "");
       this.spectatorHand = !!payload.spectatorView;
       this.handOwnerName = String(payload.handOwnerName ?? "Dealer");
       if (!this.hand.some((card) => card.id === this.selectedCardId)) this.selectedCardId = "";
+
+      if (incomingNewCardId && incomingNewCardId !== this.lastHandNewCardId && !this.spectatorHand) {
+        this.localPulseDuration = Number(payload.pulseMs ?? Net.lastRoomInfo?.pulseMs ?? 5000) || 5000;
+        this.localPulseDeadline = Date.now() + this.localPulseDuration;
+        this.lastHandNewCardId = incomingNewCardId;
+      }
       this.render();
     });
     this.offToast = Net.on("toast", (payload) => this.toast(payload.message ?? String(payload)));
@@ -165,10 +179,36 @@ export class GameScene extends Phaser.Scene {
       this.countdownNumber?.setText(String(Math.max(0, Math.ceil(countdownMs / 1000))));
       return;
     }
+    const scrambleActive = Boolean(Net.lastRoomInfo?.scrambleActive ?? state.scrambleActive);
+    if (scrambleActive) {
+      this.pulseText.setText("SPOON SCRAMBLE!");
+      if (this.cardTimerText?.active) this.cardTimerText.setText("");
+      return;
+    }
     const remaining = this.getPulseSecondsRemainingPrecise();
-    this.pulseText.setText(state.scrambleActive ? `SPOON SCRAMBLE! Passes continue in ${remaining.toFixed(1)}s` : `Next pass in ${remaining.toFixed(1)}s`);
+    this.pulseText.setText(`Next pass in ${remaining.toFixed(1)}s`);
     if (this.cardTimerText?.active) {
-      this.cardTimerText.setText(`${Math.max(0, Math.ceil(remaining))}s`);
+      this.cardTimerText.setText(`${Math.max(1, Math.ceil(remaining))}s`);
+    }
+  }
+
+  private anchorPulseFromRoomInfo(info: any) {
+    const scrambleActive = Boolean(info?.scrambleActive);
+    const roundStartsAt = Number(info?.roundStartsAt ?? 0);
+    const nextPulseAt = Number(info?.nextPulseAt ?? 0);
+    const nextPulseMs = Number(info?.nextPulseMs ?? 0);
+
+    if (scrambleActive || roundStartsAt > 0 || nextPulseAt <= 0 || nextPulseMs <= 0) {
+      this.localPulseDeadline = 0;
+      this.localPulseKey = "";
+      return;
+    }
+
+    const key = String(nextPulseAt);
+    if (key !== this.localPulseKey) {
+      this.localPulseKey = key;
+      this.localPulseDuration = Number(info?.pulseMs ?? 5000) || 5000;
+      this.localPulseDeadline = Date.now() + nextPulseMs;
     }
   }
 
@@ -261,7 +301,7 @@ export class GameScene extends Phaser.Scene {
               : this.newCardFaceDown
               ? "Tap FLIP on the new card, then choose one of your 5 cards to pass left."
               : "Choose one card to pass left before the timer reaches zero.";
-    this.objects.push(this.add.text(640, 118, status, {
+    this.objects.push(this.add.text(640, 104, status, {
       fontFamily: "Arial",
       fontSize: "19px",
       color: "#ffffff",
@@ -320,8 +360,8 @@ export class GameScene extends Phaser.Scene {
     const rows = Math.ceil(totalSlots / cols);
     const spoonW = totalSlots > 30 ? 18 : totalSlots > 20 ? 20 : 24;
     const spoonH = totalSlots > 30 ? 38 : totalSlots > 20 ? 42 : 50;
-    const labelY = 158;
-    const padY = rows >= 3 ? 236 : 222;
+    const labelY = 150;
+    const padY = rows >= 3 ? 240 : 232;
     const startX = 640 - ((cols - 1) * spacingX) / 2;
     const startY = padY - ((rows - 1) * spacingY) / 2;
 
@@ -461,10 +501,11 @@ export class GameScene extends Phaser.Scene {
         const badge = this.add.rectangle(x, y - 83, 82, 26, badgeColour, 1).setStrokeStyle(2, 0xffffff, 0.95);
         const badgeText = this.add.text(x, y - 83, faceDown ? "FLIP" : "NEW", { fontFamily: "Arial", fontSize: "15px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
         this.objects.push(badge, badgeText);
-        if (!readOnly) {
+        const timerShouldShow = !readOnly && !Boolean(Net.lastRoomInfo?.scrambleActive ?? Net.room?.state?.scrambleActive);
+        if (timerShouldShow) {
           const seconds = this.getPulseSecondsRemaining();
           const timerBubble = this.add.rectangle(x + 58, y - 83, 42, 26, 0x102a43, 0.92).setStrokeStyle(2, 0xffffff, 0.8);
-          this.cardTimerText = this.add.text(x + 58, y - 83, `${seconds}s`, { fontFamily: "Arial", fontSize: "14px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
+          this.cardTimerText = this.add.text(x + 58, y - 83, `${Math.max(1, seconds)}s`, { fontFamily: "Arial", fontSize: "14px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
           this.objects.push(timerBubble, this.cardTimerText);
         }
       }
@@ -493,6 +534,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   private getPulseSecondsRemainingPrecise() {
+    if (this.localPulseDeadline > 0) {
+      return Math.max(0, Math.ceil((this.localPulseDeadline - Date.now()) / 100) / 10);
+    }
+
     const info = Net.lastRoomInfo ?? {};
     const receivedAt = Number(info._receivedAt ?? 0);
     const fromInfoMs = Number(info.nextPulseMs);
