@@ -149,11 +149,7 @@ export class GameScene extends Phaser.Scene {
       this.handOwnerName = String(payload.handOwnerName ?? "Dealer");
       if (!this.hand.some((card) => card.id === this.selectedCardId)) this.selectedCardId = "";
 
-      if (incomingNewCardId && incomingNewCardId !== this.lastHandNewCardId && !this.spectatorHand) {
-        this.localPulseDuration = Number(payload.pulseMs ?? Net.lastRoomInfo?.pulseMs ?? 5000) || 5000;
-        this.localPulseDeadline = Date.now() + this.localPulseDuration;
-        this.lastHandNewCardId = incomingNewCardId;
-      }
+      this.syncCardTimerFromHand(payload, incomingNewCardId);
       this.render();
     });
     this.offToast = Net.on("toast", (payload) => this.toast(payload.message ?? String(payload)));
@@ -188,7 +184,26 @@ export class GameScene extends Phaser.Scene {
     const remaining = this.getPulseSecondsRemainingPrecise();
     this.pulseText.setText(`Next pass in ${remaining.toFixed(1)}s`);
     if (this.cardTimerText?.active) {
-      this.cardTimerText.setText(`${Math.max(1, Math.ceil(remaining))}s`);
+      this.cardTimerText.setText(`${this.getPulseSecondsRemaining()}s`);
+    }
+  }
+
+  private syncCardTimerFromHand(payload: any, incomingNewCardId: string) {
+    if (!incomingNewCardId || this.spectatorHand) return;
+    const duration = Number(payload?.pulseMs ?? Net.lastRoomInfo?.pulseMs ?? 5000) || 5000;
+    this.localPulseDuration = duration;
+
+    const nextPulseMs = Number(payload?.nextPulseMs ?? Net.lastRoomInfo?.nextPulseMs ?? 0);
+    const deadline = nextPulseMs > 0 ? Date.now() + nextPulseMs : Date.now() + duration;
+
+    const isNewCard = incomingNewCardId !== this.lastHandNewCardId;
+    const isExpired = this.localPulseDeadline <= Date.now();
+    const isClearlyDifferent = Math.abs(deadline - this.localPulseDeadline) > 700;
+
+    if (isNewCard || isExpired || isClearlyDifferent) {
+      this.localPulseDeadline = deadline;
+      this.lastHandNewCardId = incomingNewCardId;
+      this.localPulseKey = String(payload?.nextPulseAt ?? incomingNewCardId);
     }
   }
 
@@ -198,17 +213,20 @@ export class GameScene extends Phaser.Scene {
     const nextPulseAt = Number(info?.nextPulseAt ?? 0);
     const nextPulseMs = Number(info?.nextPulseMs ?? 0);
 
-    if (scrambleActive || roundStartsAt > 0 || nextPulseAt <= 0 || nextPulseMs <= 0) {
+    if (scrambleActive || roundStartsAt > 0) {
       this.localPulseDeadline = 0;
       this.localPulseKey = "";
       return;
     }
 
+    if (!this.newCardId || this.spectatorHand || nextPulseAt <= 0 || nextPulseMs <= 0) return;
+
     const key = String(nextPulseAt);
-    if (key !== this.localPulseKey) {
+    const deadline = Date.now() + nextPulseMs;
+    if (key !== this.localPulseKey || Math.abs(deadline - this.localPulseDeadline) > 700) {
       this.localPulseKey = key;
       this.localPulseDuration = Number(info?.pulseMs ?? 5000) || 5000;
-      this.localPulseDeadline = Date.now() + nextPulseMs;
+      this.localPulseDeadline = deadline;
     }
   }
 
@@ -556,7 +574,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   private getPulseSecondsRemaining() {
-    return Math.max(0, Math.ceil(this.getPulseSecondsRemainingPrecise()));
+    if (this.localPulseDeadline > 0) {
+      return Math.max(1, Math.ceil((this.localPulseDeadline - Date.now()) / 1000));
+    }
+    return Math.max(1, Math.ceil(this.getPulseSecondsRemainingPrecise()));
   }
 
   private drawRoundInfo(roster: PlayerLike[], me?: PlayerLike) {

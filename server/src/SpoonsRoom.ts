@@ -294,7 +294,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.scheduleNextPulse();
   }
 
-  private scheduleNextPulse() {
+  private scheduleNextPulse(resetDeadline = true) {
     if (this.state.phase !== "playing" || this.state.roundStartsAt > 0 || this.state.scrambleActive) {
       this.state.nextPulseAt = 0;
       this.syncState();
@@ -303,7 +303,8 @@ export class SpoonsRoom extends Room<SpoonsState> {
     }
 
     if (this.pulseTimer) clearTimeout(this.pulseTimer);
-    this.state.nextPulseAt = Date.now() + PULSE_MS;
+    if (resetDeadline || this.state.nextPulseAt <= Date.now()) this.state.nextPulseAt = Date.now() + PULSE_MS;
+    const delay = Math.max(50, this.state.nextPulseAt - Date.now());
     this.syncState();
     // Send an explicit roomInfo packet as soon as the timer starts so clients can
     // run a smooth local 5 second card countdown between server pulses.
@@ -318,14 +319,17 @@ export class SpoonsRoom extends Room<SpoonsState> {
         this.sendAllRoomInfo();
         return;
       }
+      // Pre-anchor the next visible card timer before sending hands from pulse().
+      // scheduleNextPulse() below will attach the actual timeout using the same window.
+      this.state.nextPulseAt = Date.now() + PULSE_MS;
       this.pulse();
-      if (this.state.phase === "playing" && this.state.roundStartsAt === 0 && !this.state.scrambleActive) this.scheduleNextPulse();
+      if (this.state.phase === "playing" && this.state.roundStartsAt === 0 && !this.state.scrambleActive) this.scheduleNextPulse(false);
       else {
         this.state.nextPulseAt = 0;
         this.syncState();
         this.sendAllRoomInfo();
       }
-    }, PULSE_MS);
+    }, delay);
   }
 
   private pulse() {
@@ -339,13 +343,18 @@ export class SpoonsRoom extends Room<SpoonsState> {
       return;
     }
 
-    // The pulse is the deadline. Any unflipped cards are revealed by the server here
-    // so the round continues, but four-of-a-kind could not be recognised before this point.
-    for (const id of order) this.ensureNewCardFlipped(id);
-
+    // The pulse is the deadline. If a player has not flipped their new card,
+    // that exact face-down card is passed on untouched. The server does not
+    // auto-reveal it and it cannot count toward four-of-a-kind for that player.
     for (const id of order) {
       const p = this.players.get(id);
       const hand = this.hands.get(id) ?? [];
+      const unflippedId = this.unflippedNewCards.get(id);
+      if (unflippedId && hand.some((card) => card.id === unflippedId)) {
+        this.selected.set(id, unflippedId);
+        this.clearBotFlipTimer(id);
+        continue;
+      }
       if (p?.isBot || !this.selected.has(id)) {
         const pick = this.pickBotDiscard(hand);
         if (pick) this.selected.set(id, pick.id);
@@ -361,7 +370,10 @@ export class SpoonsRoom extends Room<SpoonsState> {
       const fallback = this.pickBotDiscard(hand);
       const cardIndex = idx >= 0 ? idx : fallback ? hand.findIndex((c) => c.id === fallback.id) : hand.length - 1;
       const [card] = hand.splice(Math.max(0, cardIndex), 1);
-      if (card) outgoing.set(id, card);
+      if (card) {
+        outgoing.set(id, card);
+        if (this.unflippedNewCards.get(id) === card.id) this.unflippedNewCards.delete(id);
+      }
     }
 
     for (let i = 0; i < order.length; i++) {
@@ -418,9 +430,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
     const cardId = this.unflippedNewCards.get(playerId);
     if (!cardId) return;
     this.unflippedNewCards.delete(playerId);
-    const timer = this.botFlipTimers.get(playerId);
-    if (timer) clearTimeout(timer);
-    this.botFlipTimers.delete(playerId);
+    this.clearBotFlipTimer(playerId);
     this.sendHand(playerId);
     if (!silent && this.hasFourOfKindRevealed(playerId)) {
       this.clients.find((c) => c.sessionId === playerId)?.send("toast", { message: "Four of a kind! Click a silver spoon!" });
@@ -432,10 +442,14 @@ export class SpoonsRoom extends Room<SpoonsState> {
     const cardId = this.unflippedNewCards.get(playerId);
     if (!cardId) return false;
     this.unflippedNewCards.delete(playerId);
+    this.clearBotFlipTimer(playerId);
+    return true;
+  }
+
+  private clearBotFlipTimer(playerId: string) {
     const timer = this.botFlipTimers.get(playerId);
     if (timer) clearTimeout(timer);
     this.botFlipTimers.delete(playerId);
-    return true;
   }
 
   private hasFourOfKindRevealed(playerId: string): boolean {
@@ -702,6 +716,8 @@ export class SpoonsRoom extends Room<SpoonsState> {
       newCardFaceDown: !!hiddenNewCardId,
       selectedCardId: spectatorView ? "" : this.selected.get(playerId) ?? "",
       pulseMs: PULSE_MS,
+      nextPulseAt: this.state.nextPulseAt,
+      nextPulseMs: this.state.nextPulseAt > 0 ? Math.max(0, this.state.nextPulseAt - Date.now()) : 0,
       spectatorView,
       handOwnerName: owner?.name ?? "Dealer"
     });
