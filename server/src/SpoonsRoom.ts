@@ -23,6 +23,8 @@ export class SpoonsRoom extends Room<SpoonsState> {
   private selected = new Map<string, string>();
   private lastReceived = new Map<string, string>();
   private unflippedNewCards = new Map<string, string>();
+  private drawPile: Card[] = [];
+  private discardPile: Card[] = [];
   private activeOrder: string[] = [];
   private awardEligibleIds: string[] = [];
   private takenSpoonSlots = new Set<number>();
@@ -233,6 +235,8 @@ export class SpoonsRoom extends Room<SpoonsState> {
       const hand = deck.splice(0, 5);
       this.hands.set(id, hand);
     }
+    this.drawPile = deck;
+    this.discardPile = [];
     this.seedOpeningHands(current);
     this.markCurrentNewCardsFaceDown();
 
@@ -257,6 +261,8 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.selected.clear();
     this.lastReceived.clear();
     this.unflippedNewCards.clear();
+    this.drawPile = [];
+    this.discardPile = [];
     this.activeOrder = [];
     this.awardEligibleIds = [];
     this.state.phase = "lobby";
@@ -405,21 +411,31 @@ export class SpoonsRoom extends Room<SpoonsState> {
       }
     }
 
-    for (let i = 0; i < order.length; i++) {
+    // Feed the table like real Spoons: the dealer receives a fresh draw-pile card,
+    // every other player receives the card from the player on their right, and
+    // the final outgoing card leaves play into the discard pile. This prevents
+    // the two-player final from endlessly recycling the same small card loop.
+    for (let i = 0; i < order.length - 1; i++) {
       const from = order[i];
-      const to = order[(i + 1) % order.length];
+      const to = order[i + 1];
       const card = outgoing.get(from);
       if (!card) continue;
-      const targetHand = this.hands.get(to);
-      if (!targetHand) continue;
-      targetHand.push(card);
-      this.lastReceived.set(to, card.id);
-      this.unflippedNewCards.set(to, card.id);
+      this.deliverIncomingCard(to, card);
     }
+
+    const lastOutgoing = outgoing.get(order[order.length - 1]);
+    if (lastOutgoing) this.discardPile.push(lastOutgoing);
+
+    const dealerId = order[0];
+    const freshCard = this.drawFreshCard(order.length);
+    if (freshCard) this.deliverIncomingCard(dealerId, freshCard);
 
     this.selected.clear();
 
-    if (!this.state.scrambleActive) this.maybeAssistSlowRound(order);
+    if (!this.state.scrambleActive) {
+      this.maybeAssistSlowRound(order);
+      this.maybeAssistHumanFinal(order);
+    }
 
     this.normalizeActiveHands(order);
 
@@ -751,6 +767,79 @@ export class SpoonsRoom extends Room<SpoonsState> {
     this.sendAllRoomInfo();
   }
 
+  private deliverIncomingCard(playerId: string, card: Card) {
+    const targetHand = this.hands.get(playerId);
+    if (!targetHand) return;
+    targetHand.push(card);
+    this.lastReceived.set(playerId, card.id);
+    this.unflippedNewCards.set(playerId, card.id);
+  }
+
+  private drawFreshCard(activeCount: number): Card | undefined {
+    if (this.drawPile.length === 0 && this.discardPile.length > 0) {
+      this.drawPile = shuffle(this.discardPile);
+      this.discardPile = [];
+    }
+    if (this.drawPile.length === 0) {
+      // Emergency fallback only: make a new shuffled deck if a very long final
+      // burns through every card. This keeps the game from stalling.
+      this.drawPile = makeDecks(activeCount);
+    }
+    return this.drawPile.shift();
+  }
+
+  private maybeAssistHumanFinal(order: string[]) {
+    const active = order
+      .map((id) => this.players.get(id))
+      .filter((p): p is PlayerData => !!p && !p.eliminated && !p.spectator && (p.connected || p.isBot));
+    const activeHumans = active.filter((p) => !p.isBot && p.connected);
+    const activeBots = active.filter((p) => p.isBot);
+
+    // If the final is two humans only, there is no bot that can force the round
+    // to finish. After a long dead final, make the current incoming card helpful
+    // for a human who already has three of a kind in their kept four cards. This
+    // does not alter the human's kept hand: they still must flip the new card,
+    // choose a discard, and take the spoon themselves.
+    if (active.length !== 2 || activeHumans.length !== 2 || activeBots.length !== 0) return;
+    if (this.pulsesThisRound < 10) return;
+    if (order.some((id) => this.hasFourOfKindRevealed(id))) return;
+
+    const targetId = order[this.pulsesThisRound % order.length];
+    const helpfulRank = this.bestThreeOfKindRank(targetId);
+    if (!helpfulRank) return;
+
+    const hand = this.hands.get(targetId);
+    const currentNewId = this.lastReceived.get(targetId) ?? "";
+    if (!hand || !currentNewId) return;
+    const idx = hand.findIndex((card) => card.id === currentNewId);
+    if (idx < 0) return;
+
+    const replaced = hand[idx];
+    if (replaced) this.discardPile.push(replaced);
+    const suitIndex = Math.floor(Math.random() * CARD_SUITS.length);
+    const card = this.makeCard(helpfulRank, suitIndex, `final-assist-${targetId}-${this.pulsesThisRound}`);
+    hand[idx] = card;
+    this.lastReceived.set(targetId, card.id);
+    this.unflippedNewCards.set(targetId, card.id);
+    this.sendHand(targetId);
+  }
+
+  private bestThreeOfKindRank(playerId: string): string {
+    const hand = this.hands.get(playerId) ?? [];
+    const currentNewId = this.lastReceived.get(playerId) ?? "";
+    const keptCards = currentNewId ? hand.filter((card) => card.id !== currentNewId) : hand.slice(0, 4);
+    const counts = this.rankCounts(keptCards);
+    let bestRank = "";
+    let bestCount = 0;
+    for (const [rank, count] of counts.entries()) {
+      if (count > bestCount) {
+        bestRank = rank;
+        bestCount = count;
+      }
+    }
+    return bestCount >= 3 ? bestRank : "";
+  }
+
   private normalizeActiveHands(order: string[] = this.activeOrder) {
     // Defensive repair for rare edge cases during disconnects / scramble timing.
     // Every active player should always have exactly 5 cards: four kept cards plus one current new card.
@@ -759,8 +848,9 @@ export class SpoonsRoom extends Room<SpoonsState> {
       if (!p || p.eliminated || p.spectator || !(p.connected || p.isBot)) continue;
       const hand = this.hands.get(id) ?? [];
       while (hand.length < 5) {
-        const rank = this.randomRank();
-        hand.push(this.makeCard(rank, Math.floor(Math.random() * CARD_SUITS.length), `repair-${id}-${hand.length}`));
+        const card = this.drawFreshCard(Math.max(2, this.activeOrder.length || order.length));
+        if (!card) break;
+        hand.push(card);
       }
       while (hand.length > 5) {
         const hiddenId = this.unflippedNewCards.get(id);

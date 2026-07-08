@@ -81,6 +81,11 @@ export class GameScene extends Phaser.Scene {
   private selectedCardId = "";
   private newCardFaceDown = false;
   private cardTimerText?: Phaser.GameObjects.Text;
+  private newCardProgressGraphic?: Phaser.GameObjects.Graphics;
+  private newCardProgressBounds?: { x: number; y: number; w: number; h: number };
+  private newCardProgressKey = "";
+  private newCardProgressStartedAt = 0;
+  private newCardProgressDurationMs = 5000;
   private localPulseDeadline = 0;
   private localPulseKey = "";
   private localPulseDuration = 5000;
@@ -95,6 +100,7 @@ export class GameScene extends Phaser.Scene {
   private serverTimeOffsetMs = 0;
   private serverTurnEndsAtMs = 0;
   private serverTurnNumber = -1;
+  private lastSpectatorHandRefreshAt = 0;
   private spectatorHand = false;
   private handOwnerName = "Dealer";
   private objects: Phaser.GameObjects.GameObject[] = [];
@@ -178,6 +184,8 @@ export class GameScene extends Phaser.Scene {
   update() {
     const state: any = Net.room?.state;
     if (!state || state.phase !== "playing") return;
+    this.updateNewCardProgressBorder();
+    this.refreshSpectatorHandIfNeeded();
     const countdownMs = this.getCountdownMs(state);
     if (countdownMs > 0) {
       const remaining = Math.max(0, Math.ceil(countdownMs / 100) / 10);
@@ -188,8 +196,30 @@ export class GameScene extends Phaser.Scene {
     this.pulseText.setText("Flip or swap quickly — cards auto-pass.");
   }
 
+  private refreshSpectatorHandIfNeeded() {
+    if (!this.spectatorHand) return;
+    const now = performance.now();
+    if (now - this.lastSpectatorHandRefreshAt < 1200) return;
+    this.lastSpectatorHandRefreshAt = now;
+    Net.room?.send("requestHand");
+  }
+
   private syncCardTimerFromHand(payload: any, incomingNewCardId: string) {
-    if (!incomingNewCardId) return;
+    if (!incomingNewCardId) {
+      this.newCardProgressKey = "";
+      this.newCardProgressBounds = undefined;
+      return;
+    }
+
+    const duration = Number(payload?.turnDurationMs ?? payload?.pulseMs ?? Net.lastRoomInfo?.turnDurationMs ?? Net.lastRoomInfo?.pulseMs ?? 5000) || 5000;
+    this.newCardProgressDurationMs = Math.max(1000, duration);
+    const turnKey = String(payload?.turnNumber ?? payload?.turnSeq ?? Net.lastRoomInfo?.turnNumber ?? Net.lastRoomInfo?.turnSeq ?? "0");
+    const progressKey = `${turnKey}:${incomingNewCardId}`;
+    if (progressKey !== this.newCardProgressKey) {
+      this.newCardProgressKey = progressKey;
+      this.newCardProgressStartedAt = performance.now();
+    }
+
     this.anchorTurnTimer(payload, incomingNewCardId);
     this.lastHandNewCardId = incomingNewCardId;
   }
@@ -289,6 +319,8 @@ export class GameScene extends Phaser.Scene {
     this.objects = [];
     this.countdownNumber = undefined;
     this.cardTimerText = undefined;
+    this.newCardProgressGraphic = undefined;
+    this.newCardProgressBounds = undefined;
     this.drawRoomCodePill(state);
     const roster = players();
     const me = roster.find((p) => p.id === Net.playerId);
@@ -521,11 +553,15 @@ export class GameScene extends Phaser.Scene {
       }
 
       if (isNew) {
+        this.newCardProgressBounds = { x, y, w: 112, h: 138 };
+        this.newCardProgressGraphic = this.add.graphics();
+        this.objects.push(this.newCardProgressGraphic);
+        this.updateNewCardProgressBorder();
+
         const badgeColour = faceDown ? 0xf97316 : 0xf59e0b;
         const badge = this.add.rectangle(x, y - 83, 82, 26, badgeColour, 1).setStrokeStyle(2, 0xffffff, 0.95);
         const badgeText = this.add.text(x, y - 83, faceDown ? "FLIP" : "NEW", { fontFamily: "Arial", fontSize: "15px", color: "#ffffff", fontStyle: "bold" }).setOrigin(0.5);
         this.objects.push(badge, badgeText);
-        // Visible per-card countdown removed. The server still auto-passes cards after the hidden delay.
       }
       if (selected) {
         const passBadge = this.add.rectangle(x, y + 83, 96, 26, 0xf97316, 1).setStrokeStyle(2, 0xffffff, 0.95);
@@ -549,6 +585,42 @@ export class GameScene extends Phaser.Scene {
 
   private updateVisibleCardTimer() {
     if (this.cardTimerText?.active) this.cardTimerText.setText(`${this.getPulseSecondsRemaining()}s`);
+  }
+
+  private updateNewCardProgressBorder() {
+    const g = this.newCardProgressGraphic;
+    const bounds = this.newCardProgressBounds;
+    if (!g?.active || !bounds || !this.newCardProgressKey) return;
+
+    const elapsed = Math.max(0, performance.now() - this.newCardProgressStartedAt);
+    const progress = Phaser.Math.Clamp(elapsed / this.newCardProgressDurationMs, 0, 1);
+    const x = bounds.x - bounds.w / 2;
+    const y = bounds.y - bounds.h / 2;
+    const w = bounds.w;
+    const h = bounds.h;
+    const perimeterProgress = progress * 4;
+
+    g.clear();
+    g.lineStyle(5, 0x0f172a, 0.35);
+    g.strokeRoundedRect(x, y, w, h, 8);
+    g.lineStyle(6, progress > 0.82 ? 0xf97316 : 0x38bdf8, 1);
+
+    const drawTop = Math.min(1, perimeterProgress);
+    if (drawTop > 0) g.lineBetween(x, y, x + w * drawTop, y);
+
+    const drawRight = Math.min(1, Math.max(0, perimeterProgress - 1));
+    if (drawRight > 0) g.lineBetween(x + w, y, x + w, y + h * drawRight);
+
+    const drawBottom = Math.min(1, Math.max(0, perimeterProgress - 2));
+    if (drawBottom > 0) g.lineBetween(x + w, y + h, x + w - w * drawBottom, y + h);
+
+    const drawLeft = Math.min(1, Math.max(0, perimeterProgress - 3));
+    if (drawLeft > 0) g.lineBetween(x, y + h, x, y + h - h * drawLeft);
+
+    if (progress >= 1) {
+      g.lineStyle(3, 0xf97316, 0.75 + 0.25 * Math.sin(performance.now() / 120));
+      g.strokeRoundedRect(x - 3, y - 3, w + 6, h + 6, 10);
+    }
   }
 
   private getPulseMsRemaining() {
