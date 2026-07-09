@@ -917,29 +917,41 @@ export class SpoonsRoom extends Room<SpoonsState> {
   }
 
   private sendSpectatorHandsFor(ownerId: string) {
-    if (!this.isActiveHandOwner(ownerId)) return;
+    // Spectators should follow the current dealer only. Earlier hotfixes sent
+    // the spectator view to whichever player just flipped/selected, which made
+    // eliminated players see everyone's moves. Ignore non-dealer hand actions.
+    const dealerOwnerId = this.currentDealerHandOwner();
+    if (!dealerOwnerId || ownerId !== dealerOwnerId) return;
     for (const client of this.clients) {
       const p = this.players.get(client.sessionId);
       if (p && this.state.phase === "playing" && (p.spectator || p.eliminated)) {
-        this.sendHand(client.sessionId, ownerId);
+        this.sendHand(client.sessionId, dealerOwnerId);
       }
     }
   }
 
-  private resolveSpectatorHandOwner(spectatorId: string, preferredOwnerId = "") {
-    if (preferredOwnerId && this.isActiveHandOwner(preferredOwnerId)) {
-      this.spectatorWatchTargets.set(spectatorId, preferredOwnerId);
-      return preferredOwnerId;
+  private resolveSpectatorHandOwner(spectatorId: string, _preferredOwnerId = "") {
+    const dealerOwnerId = this.currentDealerHandOwner();
+    if (dealerOwnerId) {
+      this.spectatorWatchTargets.set(spectatorId, dealerOwnerId);
+      return dealerOwnerId;
     }
 
     const currentTarget = this.spectatorWatchTargets.get(spectatorId) ?? "";
     if (currentTarget && this.isActiveHandOwner(currentTarget)) return currentTarget;
 
-    const fallback = this.isActiveHandOwner(this.state.dealerId)
-      ? this.state.dealerId
-      : this.activeOrder.find((id) => this.isActiveHandOwner(id)) ?? spectatorId;
-    if (fallback !== spectatorId) this.spectatorWatchTargets.set(spectatorId, fallback);
-    return fallback;
+    return spectatorId;
+  }
+
+  private currentDealerHandOwner() {
+    // The live card-flow dealer is the first active player in activeOrder. The
+    // state.dealerId may be updated mid-scramble to seed the next round's dealer,
+    // so do not use it to switch spectator view until the next round is actually
+    // begun and activeOrder is rotated.
+    const orderDealerId = this.activeOrder[0] ?? "";
+    if (this.isActiveHandOwner(orderDealerId)) return orderDealerId;
+    if (this.isActiveHandOwner(this.state.dealerId)) return this.state.dealerId;
+    return this.activeOrder.find((id) => this.isActiveHandOwner(id)) ?? "";
   }
 
   private isActiveHandOwner(playerId: string) {
@@ -949,9 +961,7 @@ export class SpoonsRoom extends Room<SpoonsState> {
 
   private resetSpectatorWatchTargets(defaultOwnerId = "") {
     this.spectatorWatchTargets.clear();
-    const ownerId = this.isActiveHandOwner(defaultOwnerId)
-      ? defaultOwnerId
-      : this.activeOrder.find((id) => this.isActiveHandOwner(id)) ?? "";
+    const ownerId = this.currentDealerHandOwner() || (this.isActiveHandOwner(defaultOwnerId) ? defaultOwnerId : "");
     if (!ownerId) return;
     for (const client of this.clients) {
       const p = this.players.get(client.sessionId);
