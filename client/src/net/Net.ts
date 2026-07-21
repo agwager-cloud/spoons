@@ -2,8 +2,14 @@ import { Client, Room } from "colyseus.js";
 import { getDeviceId } from "../utils/device";
 
 export type SpoonsRoom = Room<any>;
+export type ConnectionProgress = (message: string, elapsedSeconds: number) => void;
 
 type MessageHandler = (payload: any) => void;
+
+const CONNECT_WINDOW_MS = 100_000;
+const MATCHMAKING_ATTEMPT_MS = 45_000;
+const STATUS_REQUEST_MS = 6_000;
+const INITIAL_SYNC_MS = 20_000;
 
 class NetService {
   client: Client | null = null;
@@ -39,6 +45,10 @@ class NetService {
     return "wss://spoons-67eu.onrender.com";
   }
 
+  getHttpServerUrl(): string {
+    return this.getServerUrl().replace(/^wss:/, "https:").replace(/^ws:/, "http:");
+  }
+
   private getClient(): Client {
     const serverUrl = this.getServerUrl();
     if (!serverUrl) {
@@ -47,25 +57,186 @@ class NetService {
     return new Client(serverUrl);
   }
 
-  async createRoom(name: string): Promise<SpoonsRoom> {
+  async createRoom(name: string, onProgress?: ConnectionProgress): Promise<SpoonsRoom> {
     await this.leave();
-    this.client = this.getClient();
     const roomCode = this.makeRoomCode();
-    const room = await this.client.create("spoons", { name, roomCode, deviceId: getDeviceId() });
+    const room = await this.connectWithRenderWake(
+      "Creating the classroom room",
+      async () => {
+        this.client = this.getClient();
+        return this.client.create("spoons", { name, roomCode, deviceId: getDeviceId() });
+      },
+      onProgress
+    );
     this.attach(room);
     room.send("requestRoomInfo");
     await this.waitForInitialSync(room);
     return room;
   }
 
-  async joinRoom(name: string, roomCode: string): Promise<SpoonsRoom> {
+  async joinRoom(name: string, roomCode: string, onProgress?: ConnectionProgress): Promise<SpoonsRoom> {
     await this.leave();
-    this.client = this.getClient();
-    const room = await this.client.join("spoons", { name, roomCode, deviceId: getDeviceId() });
+    const room = await this.connectWithRenderWake(
+      "Joining the classroom room",
+      async () => {
+        this.client = this.getClient();
+        return this.client.join("spoons", { name, roomCode, deviceId: getDeviceId() });
+      },
+      onProgress,
+      true
+    );
     this.attach(room);
     room.send("requestRoomInfo");
     await this.waitForInitialSync(room);
     return room;
+  }
+
+  private async connectWithRenderWake(
+    actionLabel: string,
+    action: () => Promise<SpoonsRoom>,
+    onProgress?: ConnectionProgress,
+    joining = false
+  ): Promise<SpoonsRoom> {
+    const startedAt = Date.now();
+    const deadline = startedAt + CONNECT_WINDOW_MS;
+    // Reserve at least 30 seconds for Colyseus matchmaking after the wake checks.
+    const wakeDeadline = Math.min(deadline - 30_000, startedAt + 70_000);
+    let statusAttempt = 0;
+    let serverReachable = false;
+    let consecutiveFastFailures = 0;
+
+    while (Date.now() < wakeDeadline && !serverReachable) {
+      statusAttempt += 1;
+      const checkStartedAt = Date.now();
+      serverReachable = await this.wakeServer(startedAt, onProgress, statusAttempt);
+      if (serverReachable) break;
+
+      const checkDuration = Date.now() - checkStartedAt;
+      consecutiveFastFailures = checkDuration < 800 ? consecutiveFastFailures + 1 : 0;
+
+      // Two immediate failures usually mean a normal-profile extension is blocking
+      // background fetches. Do not make the teacher wait 70 seconds before trying
+      // the real secure WebSocket, which may still be allowed.
+      if (consecutiveFastFailures >= 2 && Date.now() - startedAt >= 4_000) break;
+
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      onProgress?.(
+        elapsed < 60
+          ? "The free server is still waking. This is normal—Spoons is checking again automatically."
+          : "The server is taking longer than usual, but Spoons is still checking it automatically.",
+        elapsed
+      );
+      await this.delay(Math.min(2500, Math.max(250, wakeDeadline - Date.now())));
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error("Spoons could not reach the classroom server within 100 seconds.");
+    }
+
+    onProgress?.(`${actionLabel}… please keep this window open.`, Math.floor((Date.now() - startedAt) / 1000));
+    try {
+      // The room request is made once only. This avoids accidentally creating two
+      // host rooms if a sleeping server responds just after a client-side timeout.
+      return await this.withTimeout(
+        action(),
+        Math.max(10_000, remaining),
+        "The multiplayer connection did not finish within the 100-second classroom connection window."
+      );
+    } catch (err) {
+      const message = this.errorText(err).toLowerCase();
+      if (joining && serverReachable && this.isRoomNotFoundError(message)) {
+        throw new Error("Room not found. Check the 5-digit code and make sure the host is still in the lobby.");
+      }
+      if (joining && this.isRoomNotFoundError(message)) {
+        throw new Error("Room not found. Check the 5-digit code and make sure the host is still in the lobby.");
+      }
+      if (!this.isRetriableConnectionError(message)) throw err;
+      throw new Error(
+        "Spoons could not connect after allowing the free server up to 100 seconds to wake. " +
+          "If it works in InPrivate/Incognito but not in a normal window, a browser extension or school security rule is blocking the Render connection."
+      );
+    }
+  }
+
+  private async wakeServer(startedAt: number, onProgress?: ConnectionProgress, attempt = 1): Promise<boolean> {
+    const base = this.getHttpServerUrl().replace(/\/$/, "");
+    const endpoint = attempt % 2 === 1 ? "/api/status" : "/";
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), STATUS_REQUEST_MS);
+
+    try {
+      onProgress?.(
+        attempt === 1 ? "Waking the free classroom server…" : "Checking whether the classroom server is ready…",
+        Math.floor((Date.now() - startedAt) / 1000)
+      );
+      const response = await fetch(`${base}${endpoint}`, {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal,
+        headers: { Accept: "application/json, text/plain, */*" }
+      });
+      return response.ok;
+    } catch {
+      // This request is only a wake-up aid. Some managed browser profiles block
+      // background requests while still allowing the real secure WebSocket.
+      return false;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+
+  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+      promise.then(
+        (value) => {
+          window.clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          window.clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
+  }
+
+  private isRoomNotFoundError(message: string): boolean {
+    return (
+      message.includes("room not found") ||
+      message.includes("no rooms found") ||
+      message.includes("no available rooms") ||
+      message.includes("matchmake") ||
+      message.includes("seat reservation expired")
+    );
+  }
+
+  private isRetriableConnectionError(message: string): boolean {
+    return (
+      !message ||
+      message.includes("timeout") ||
+      message.includes("still waiting") ||
+      message.includes("network") ||
+      message.includes("failed to fetch") ||
+      message.includes("websocket") ||
+      message.includes("connection") ||
+      message.includes("502") ||
+      message.includes("503") ||
+      message.includes("504") ||
+      message.includes("matchmake") ||
+      message.includes("seat reservation") ||
+      message.includes("load failed") ||
+      message.includes("blocked")
+    );
+  }
+
+  private errorText(err: unknown): string {
+    return err instanceof Error ? err.message : err == null ? "" : String(err);
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   private attach(room: SpoonsRoom) {
@@ -101,7 +272,7 @@ class NetService {
   }
 
   private waitForInitialSync(room: SpoonsRoom): Promise<void> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let done = false;
       let dispose: any;
       const finish = () => {
@@ -118,13 +289,13 @@ class NetService {
       window.setTimeout(() => {
         room.send("requestRoomInfo");
         finish();
-      }, 80);
+      }, 100);
       window.setTimeout(() => {
         if (done) return;
         done = true;
         if (typeof dispose === "function") dispose();
-        resolve();
-      }, 900);
+        reject(new Error("Connected to the server, but the first classroom update did not arrive within 20 seconds."));
+      }, INITIAL_SYNC_MS);
     });
   }
 

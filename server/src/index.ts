@@ -10,8 +10,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get("/", (_req, res) => res.status(200).send("Spoons server is running."));
-app.get("/health", (_req, res) => res.status(200).json({ ok: true, service: "spoons", time: new Date().toISOString() }));
+const statusPayload = () => ({
+  ok: true,
+  service: "spoons",
+  status: "ready",
+  time: new Date().toISOString()
+});
+
+app.get("/", (_req, res) => res.status(200).json(statusPayload()));
+app.get("/api/status", (_req, res) => res.status(200).json(statusPayload()));
+// Kept for Render monitoring and compatibility with older game builds.
+app.get("/health", (_req, res) => res.status(200).json(statusPayload()));
 
 const server = createServer(app);
 const gameServer = new Server({ transport: new WebSocketTransport({ server }) });
